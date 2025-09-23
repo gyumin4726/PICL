@@ -19,9 +19,9 @@ from mamba_1d_temporal import SequenceToValue
 from pde_physics import PINNPhysicsLoss
 
 
-class MLPClassifier(nn.Module):
+class MLPRegressor(nn.Module):
     """
-    MLP Classifier for Physical Coefficients Prediction.
+    MLP Regressor for Physical Coefficients Prediction.
     
     Predicts 3 physical coefficients: refractive index (n), 
     absorption coefficient (μa), and reduced scattering coefficient (μs').
@@ -117,8 +117,8 @@ class PICLModel(nn.Module):
             device=temporal_config['device']
         )
         
-        # 3. MLP Classifier (Physical Coefficients Predictor)
-        self.classifier = MLPClassifier(
+        # 3. MLP Regressor (Physical Coefficients Predictor)
+        self.classifier = MLPRegressor(
             input_dim=temporal_config['d_model'],
             hidden_dim=256,
             num_classes=3,  # n, μa, μs'
@@ -171,7 +171,7 @@ class PICLModel(nn.Module):
         # 2. 1D Mamba + SequenceToValue: Process temporal sequence
         temporal_features = self.temporal(features)  # (B, 512)
         
-        # 3. MLP Classifier: Predict physical coefficients
+        # 3. MLP Regressor: Predict physical coefficients
         n_pred, mu_a_pred, mu_s_prime_pred = self.classifier(temporal_features)
         
         # ========================================
@@ -250,7 +250,7 @@ class PICLModel(nn.Module):
             # 2. 1D Mamba + SequenceToValue
             temporal_features = self.temporal(features)
             
-            # 3. MLP Classifier
+            # 3. MLP Regressor
             n_pred, mu_a_pred, mu_s_prime_pred = self.classifier(temporal_features)
             
             return n_pred, mu_a_pred, mu_s_prime_pred
