@@ -71,7 +71,11 @@ class PICLDataset(Dataset):
         samples = []
         
         for material in self.materials:
-            material_dir = os.path.join(self.data_dir, f"{material}_4D", "images")
+            # Handle different naming conventions for train/test
+            if "test" in self.data_dir:
+                material_dir = os.path.join(self.data_dir, f"{material}_4D_test", "images")
+            else:
+                material_dir = os.path.join(self.data_dir, f"{material}_4D", "images")
             
             if not os.path.exists(material_dir):
                 print(f"Warning: {material_dir} not found")
@@ -178,8 +182,23 @@ class PICLClassifier(nn.Module):
         x_flat = x.view(B * T, C, H, W)  # (B*T, C, H, W)
         
         # Extract features using VMamba backbone
-        features = self.backbone(x_flat)  # (B*T, backbone_dim, H', W')
-        features = features[0]  # Get the tuple element
+        features = self.backbone(x_flat)  # Returns tuple
+        
+        # Handle tuple output format
+        if isinstance(features, tuple):
+            features = features[0]  # Get the first element from tuple
+        
+        # Handle list output format (VMamba sometimes returns list)
+        if isinstance(features, list):
+            features = features[0]  # Get the first element from list
+        
+        # Ensure features is a tensor
+        if not isinstance(features, torch.Tensor):
+            print(f"Error: Expected tensor, got {type(features)}")
+            print(f"Features content: {features}")
+            raise TypeError(f"Expected torch.Tensor, got {type(features)}")
+        
+        # features is now (B*T, backbone_dim, H', W')
         
         # Global pooling
         features = self.global_pool(features)  # (B*T, backbone_dim, 1, 1)
@@ -336,6 +355,39 @@ def main():
     
     # Create model
     model = PICLClassifier(num_classes=5)
+    
+    # Load checkpoint if available
+    checkpoint_path = "vssm_base_0229_ckpt_epoch_237.pth"
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            # Handle different checkpoint formats
+            if 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            elif 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                state_dict = checkpoint
+            
+            # Load VMamba backbone weights
+            missing_keys, unexpected_keys = model.backbone.vmamba.load_state_dict(
+                state_dict, strict=False
+            )
+            
+            print(f"Successfully loaded VMamba weights!")
+            if missing_keys:
+                print(f"Missing keys: {missing_keys[:5]}...")  # Show first 5
+            if unexpected_keys:
+                print(f"Unexpected keys: {unexpected_keys[:5]}...")  # Show first 5
+                
+        except Exception as e:
+            print(f"Failed to load checkpoint from {checkpoint_path}: {e}")
+            print("Continuing with random initialization...")
+    else:
+        print(f"Checkpoint not found: {checkpoint_path}")
+        print("Using random initialization...")
     
     # Train model
     print("\nStarting training...")
