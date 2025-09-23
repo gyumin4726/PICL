@@ -206,12 +206,16 @@ class VMambaBackbone(BaseModule):
             # Reshape back to batch format
             if len(self.out_indices) == 1:
                 # Single output: (B*T, dims[i], H_i, W_i) -> (B, T, dims[i], H_i, W_i)
+                if isinstance(features_flat, (tuple, list)):
+                    features_flat = features_flat[0]  # Get the first element
                 features = features_flat.view(B, T, *features_flat.shape[1:])
                 return (features,)
             else:
                 # Multiple outputs: tuple of (B, T, dims[i], H_i, W_i)
                 features_list = []
                 for feat in features_flat:
+                    if isinstance(feat, (tuple, list)):
+                        feat = feat[0]  # Get the first element
                     feat_reshaped = feat.view(B, T, *feat.shape[1:])
                     features_list.append(feat_reshaped)
                 return tuple(features_list)
