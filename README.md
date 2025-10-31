@@ -2,34 +2,186 @@
 
 ## 🎯 연구 개요
 
-이 저장소는 **물리 정보 기반 연속 학습(Physics-Informed Continual Learning, PICL)** 프레임워크를 구현하여, **VMamba**와 **1D Mamba** 아키텍처를 사용해 시간 게이트 광학 산란 이미지로부터 재료의 굴절률을 추정하는 광학 역문제를 해결합니다.
+이 저장소는 **물리 정보 기반 연속 학습(Physics-Informed Continual Learning, PICL)** 프레임워크를 구현하여, **VMamba**와 **1D Mamba** 아키텍처를 사용해 시간 게이트 광학 산란 이미지로부터 재료의 **3가지 물리계수**를 역추정하는 광학 역문제를 해결합니다.
+
+### 핵심 목표
+- **입력**: 5장의 시간 게이트 광학 산란 이미지 시퀀스
+- **출력**: 3가지 물리계수 예측
+  1. 굴절률 (n)
+  2. 흡수 계수 (μa)
+  3. 등방 환산 산란 계수 (μs')
+- **방법**: 물리 정보 기반 신경망 (PINN) - 데이터 손실 + 물리 손실
+
+### 주요 혁신
+1. **이중 경로 아키텍처**: 신경망 예측 경로와 물리량 계산 경로의 병렬 처리
+2. **시간 의존 확산 방정식 통합**: 예측된 물리계수가 물리 법칙을 만족하는지 자동 검증
+3. **효율적인 시퀀스 모델링**: 1D Mamba를 사용한 시간적 의존성 처리
 
 ## 🏗️ 아키텍처 개요
 
-### 데이터 흐름 파이프라인
+### 완전한 PICL 파이프라인 (이중 경로 구조)
+
+PICL 모델은 **동시에 실행되는 두 개의 독립적인 경로**로 구성되어 있습니다:
 
 ```
-5장의 시간 게이트 이미지 → 2D VMamba → 1D Mamba → 재료 분류
-(B, 5, 3, 224, 224) → (B, 5, 1024) → (B, 512) → (B, 5)
+입력: 5장의 시간 게이트 이미지 (B, 5, 3, 224, 224)
+│
+├─ PATH 1: 신경망 예측 경로 ────────────────────┐
+│   │                                              │
+│   ├─ 2D VMamba (공간 특징 추출)                 │
+│   │   (B, 5, 3, 224, 224) → (B*5, 1024, H', W')│
+│   │                                              │
+│   ├─ Global Average Pooling (공간 차원 제거)    │
+│   │   (B*5, 1024, H', W') → (B*5, 1024)        │
+│   │                                              │
+│   ├─ 1D Mamba + SequenceToValue (시간 처리)     │
+│   │   (B, 5, 1024) → (B, 512)                   │
+│   │                                              │
+│   └─ MLP Regressor (물리계수 예측)              │
+│       (B, 512) → (B, 3)                          │
+│       출력: n_pred, μa_pred, μs'_pred           │
+│                                                 │
+└─ PATH 2: 물리량 계산 경로 ────────────────────┤
+    │                                              │
+    ├─ 원본 이미지 직접 사용 (grayscale 변환)     │
+    │   (B, 5, 3, 224, 224) → (B, 5, 224, 224)    │
+    │                                              │
+    ├─ 물리량 계산                                │
+    │   - Φ(r,t): 원본 이미지 픽셀값              │
+    │   - ∂Φ/∂t: 시간 미분 (유한 차분법)          │
+    │   - ∇²Φ: 공간 라플라시안 (유한 차분법)      │
+    │                                              │
+    └─ 출력: 물리량 (Φ, ∂Φ/∂t, ∇²Φ)              │
+                                                 │
+──────────────────────────────────────────────────┘
+                      ↓
+              최종 결합: PINN 손실 계산
+                      ↓
+    PDE 방정식: n/c * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = 0
+                      ↓
+    Residual = (예측값 + 계산값) → 0에 가까워야 함
+                      ↓
+    Loss = Data Loss + Physics Loss
 ```
 
-### 1. **2D VMamba 백본** (공간 특징 추출기)
+### PATH 1: 신경망 예측 경로 (Neural Network Prediction)
+
+#### 1. **2D VMamba 백본** (공간 특징 추출기)
 - **입력**: `(B, 5, 3, 224, 224)` - 5장의 시간 게이트 이미지 (0-1ns, 1-2ns, 2-3ns, 3-4ns, 4-5ns)
-- **출력**: `(B, 5, 1024)` - 각 시간 스텝의 공간 특징 벡터
-- **역할**: 각 개별 이미지 프레임에서 공간 특징을 추출
-- **구현**: `vmamba_backbone.py`
+- **처리**: 
+  - 이미지를 `(B*5, 3, 224, 224)`로 평탄화하여 VMamba에 입력
+  - VMamba 백본이 각 이미지에서 공간 특징 추출
+  - **공간 차원 보존**: `(B*5, 1024, H', W')` 형태로 출력
+- **구현**: `vmamba_backbone.py`의 `VMambaBackbone` 클래스
 
-### 2. **1D Mamba** (시간 시퀀스 모델러)
-- **입력**: `(B, 5, 1024)` - 공간 특징 벡터들의 시퀀스
-- **출력**: `(B, 5, 1024)` - 시간적 의존성을 포함한 처리된 시퀀스
-- **역할**: 연속된 시간 스텝 간의 시간적 관계를 모델링
-- **구현**: `mamba_1d_temporal.py` (state-spaces/mamba의 공식 Mamba1D)
+#### 2. **Global Average Pooling** (공간 차원 제거)
+- **입력**: `(B*5, 1024, H', W')` - 공간 차원이 있는 특징맵
+- **처리**: 각 특징맵을 `(1, 1)`로 풀링하여 공간 정보를 평균으로 집약
+- **출력**: `(B*5, 1024)` - 각 이미지마다 하나의 벡터
+- **이유**: 1D Mamba는 시퀀스 형태 `(B, T, D)` 입력이 필요하므로 공간 차원 제거 필요
 
-### 3. **시퀀스-투-밸류** (최종 예측)
-- **입력**: `(B, 5, 1024)` - 1D Mamba에서 처리된 시퀀스
-- **출력**: `(B, 512)` - 최종 특징 벡터 (h_5는 모든 시간 정보를 포함)
-- **역할**: 마지막 시간 스텝을 사용하여 시퀀스를 단일 예측으로 변환
+#### 3. **1D Mamba + SequenceToValue** (시간 시퀀스 모델러)
+- **입력**: `(B, 5, 1024)` - 5개 시간 스텝의 특징 벡터 시퀀스
+- **처리**:
+  - 1D Mamba가 시퀀스를 처리하여 시간적 의존성 모델링
+  - SequenceToValue가 마지막 시간 스텝(`h_5`) 선택
+  - `h_5`는 모든 이전 시간 정보를 포함한 누적 특징
+- **출력**: `(B, 512)` - 최종 시간적 특징 벡터
 - **구현**: `mamba_1d_temporal.py`의 `SequenceToValue` 클래스
+
+#### 4. **MLP Regressor** (물리계수 예측)
+- **입력**: `(B, 512)` - 시간적 특징 벡터
+- **처리**: 3개의 완전연결층을 통과하여 물리계수 예측
+- **출력**: `(B, 3)` - 3개의 물리계수
+  - `n_pred`: 굴절률 (Refractive Index)
+  - `mu_a_pred`: 흡수 계수 (Absorption Coefficient)
+  - `mu_s_prime_pred`: 등방 환산 산란 계수 (Reduced Scattering Coefficient)
+- **구현**: `picl_model.py`의 `MLPRegressor` 클래스
+
+### PATH 2: 물리량 계산 경로 (Physics Quantities Computation)
+
+#### 1. **원본 이미지 전처리**
+- **입력**: `(B, 5, 3, 224, 224)` - 원본 RGB 이미지 시퀀스
+- **처리**: RGB를 grayscale로 변환 (평균값 사용)
+- **출력**: `(B, 5, 224, 224)` - 플루언스율 `Φ(r,t)`에 해당하는 이미지
+
+#### 2. **시간 미분 계산** (∂Φ/∂t)
+- **입력**: `(B, 5, 224, 224)` - 플루언스율 시퀀스
+- **방법**: 유한 차분법 (Forward Difference)
+  ```python
+  ∂Φ/∂t ≈ (Φ(t+1) - Φ(t)) / Δt
+  ```
+- **출력**: `(B, 4, 224, 224)` - 4개의 시간 간격에 대한 미분
+  - 간격 0: t1-t2
+  - 간격 1: t2-t3
+  - 간격 2: t3-t4
+  - 간격 3: t4-t5
+- **구현**: `pde_physics.py`의 `compute_time_derivative()` 메서드
+
+#### 3. **공간 미분 계산** (∇·(D∇Φ))
+- **입력**: `(B, 5, 224, 224)` - 플루언스율 시퀀스
+- **대표 시점**: 2번째 이미지 (인덱스 1) 사용
+- **방법**: 유한 차분법 (Central Difference)
+  ```python
+  ∇Φ = (∂Φ/∂x, ∂Φ/∂y)  # 기울기
+  D∇Φ = D × ∇Φ          # 확산 계수 곱하기
+  ∇·(D∇Φ) = ∂(D∂Φ/∂x)/∂x + ∂(D∂Φ/∂y)/∂y  # 발산
+  ```
+- **출력**: `(B, 224, 224)` - 2번째 시점의 공간 미분 (나중에 4번 복제됨)
+- **구현**: `pde_physics.py`의 `compute_gradient_divergence()` 메서드
+
+#### 4. **확산 계수 계산** (D)
+- **입력**: 예측된 `μa`, `μs'`
+- **공식**: 
+  ```python
+  D = 1 / (3 * (μa + μs'))
+  ```
+- **출력**: `(B, 1, 1, 1)` - 배치별 확산 계수
+- **구현**: `pde_physics.py`의 `diffusion_coefficient()` 메서드
+
+### 최종 결합: PINN 손실 계산 (Physics-Informed Loss)
+
+#### 1. **PDE 잔차 계산** (Residual)
+- **방정식**: 
+  ```
+  n/c * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = S(r,t) ≈ 0
+  ```
+- **입력**:
+  - PATH 1 결과: `n_pred`, `mu_a_pred`, `mu_s_prime_pred` (예측값)
+  - PATH 2 결과: `Φ`, `∂Φ/∂t`, `∇·(D∇Φ)` (계산값)
+- **계산**:
+  ```python
+  residual = (n_pred/c) * dphi_dt + mu_a_pred * phi - div_D_grad_phi - source
+  ```
+- **출력**: `(B, 4, 224, 224)` - 각 시간 간격과 각 픽셀마다의 잔차
+- **구현**: `pde_physics.py`의 `pde_residual()` 메서드
+
+#### 2. **물리 손실** (Physics Loss)
+- **계산**:
+  ```python
+  physics_loss = mean(residual^2)
+  ```
+  - 모든 픽셀의 잔차를 제곱한 후 평균
+  - 총 `B × 4 × 224 × 224` 개의 값에 대해 평균
+- **의미**: 예측된 물리계수가 물리 법칙을 얼마나 잘 만족하는지 측정
+  - `physics_loss ≈ 0`: 물리 법칙을 잘 만족
+  - `physics_loss > 0`: 물리 법칙 위반
+- **구현**: `pde_physics.py`의 `physics_loss()` 메서드
+
+#### 3. **데이터 손실** (Data Loss)
+- **계산**:
+  ```python
+  data_loss = MSE(n_pred, n_true)
+  ```
+- **의미**: 예측된 굴절률과 실제 굴절률 간의 차이
+
+#### 4. **최종 PINN 손실**
+- **계산**:
+  ```python
+  total_loss = data_weight * data_loss + physics_weight * physics_loss
+  ```
+- **의미**: 데이터 적합도와 물리 법칙 만족도를 균형있게 결합
+- **구현**: `pde_physics.py`의 `PINNPhysicsLoss` 클래스
 
 ## 📊 데이터셋 구조
 
@@ -107,28 +259,94 @@ features = torch.randn(2, 5, 1024)  # 2D VMamba에서
 final_features = seq2val(features)  # (B, 512) - 모든 시간 정보를 포함한 h_5
 ```
 
-#### 완전한 PICL 파이프라인
+#### 완전한 PICL 파이프라인 (물리계수 예측 + PINN 손실)
 ```python
-# 완전한 파이프라인: 이미지 → 분류
-from picl_classification_experiment import PICLClassifier
+from picl_model import PICLModel
+import torch
 
-model = PICLClassifier(num_classes=5)
+# 모델 초기화
+model = PICLModel(
+    backbone_model='vmamba_base_s2l15',
+    pretrained_path='./vssm_base_0229_ckpt_epoch_237.pth',
+    temporal_config={
+        'input_dim': 1024,
+        'd_model': 512,
+        'device': 'cuda'
+    },
+    physics_config={
+        'physics_weight': 1.0,  # 물리 손실 가중치
+        'data_weight': 1.0,     # 데이터 손실 가중치
+        'c': 3e8                # 진공에서의 광속
+    }
+)
+
+# 입력 데이터
 images = torch.randn(2, 5, 3, 224, 224)  # 5장의 시간 게이트 이미지
-logits = model(images)  # (B, 5) - 재료 분류
+n_true = torch.tensor([1.33, 1.52])      # 실제 굴절률 (물, 유리)
+
+# Forward pass (훈련용 - 손실 포함)
+results = model(images, n_true)
+
+# 결과 확인
+print(f"예측된 굴절률: {results['n_pred']}")
+print(f"예측된 흡수 계수: {results['mu_a_pred']}")
+print(f"예측된 산란 계수: {results['mu_s_prime_pred']}")
+print(f"총 손실: {results['total_loss']}")
+print(f"데이터 손실: {results['data_loss']}")
+print(f"물리 손실: {results['physics_loss']}")
+
+# 예측만 (추론용 - 손실 계산 없음)
+n_pred, mu_a_pred, mu_s_prime_pred = model.predict_coefficients(images)
 ```
 
 ### 3. 훈련
-```bash
-# 분류 실험 실행
-python picl_classification_experiment.py
+
+현재는 훈련 스크립트가 별도로 구현되지 않았습니다. `picl_model.py`를 사용하여 직접 훈련 루프를 작성하실 수 있습니다:
+
+```python
+from picl_model import PICLModel
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+# 모델 초기화
+model = PICLModel(...)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# 훈련 루프
+for epoch in range(num_epochs):
+    for batch in train_loader:
+        images = batch['images']  # (B, 5, 3, 224, 224)
+        n_true = batch['n_true']  # (B,) - 실제 굴절률
+        
+        # Forward pass (손실 포함)
+        results = model(images, n_true)
+        
+        # 역전파
+        optimizer.zero_grad()
+        results['total_loss'].backward()
+        optimizer.step()
+        
+        # 로깅
+        print(f"Epoch {epoch}, Loss: {results['total_loss']:.4f}")
+        print(f"  Data Loss: {results['data_loss']:.4f}")
+        print(f"  Physics Loss: {results['physics_loss']:.4f}")
 ```
+
+**참고**: 실제 데이터셋 로더와 훈련 스크립트는 향후 추가 예정입니다.
 
 ## 🔬 연구 맥락
 
 ### 물리 정보 기반 신경망 (PINN)
-- 관측 데이터와 물리 법칙(헬름홀츠 방정식)을 통합
-- 이중 손실 함수: 데이터 손실 + 물리 손실
-- 숨겨진 물리적 특성의 정확한 추정 가능
+- **관측 데이터와 물리 법칙 통합**: 시간 의존 확산 방정식 사용
+  ```
+  n/c * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = 0
+  ```
+- **이중 손실 함수**: 
+  - 데이터 손실: 예측값과 정답 라벨 비교
+  - 물리 손실: 예측값이 물리 방정식을 만족하는지 검증
+- **자동 물리 법칙 검증**: 예측된 물리계수가 물리 법칙을 얼마나 잘 따르는지 자동 계산
+- **물리적으로 일관된 예측**: 물리 제약 조건을 통해 더 정확하고 물리적으로 의미있는 예측 가능
 
 ### 연속 학습
 - 순차 학습에서의 파괴적 망각 문제 해결
@@ -140,6 +358,31 @@ python picl_classification_experiment.py
 - **역방향 문제**: 광학 산란 주어짐 → 굴절률 추정
 - **도전과제**: 비선형, 부적절한 문제, 시간적 동역학 모델링 필요
 
+### 시간 의존 확산 방정식 (Time-dependent Diffusion Equation)
+
+PICL 프레임워크에서 사용하는 핵심 물리 방정식:
+
+```
+n/c * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = S(r,t) ≈ 0
+```
+
+#### 방정식의 물리적 의미
+- **n/c * ∂Φ/∂t**: 플루언스율의 시간 변화 (굴절률에 의한 빛의 속도 조절)
+- **μa*Φ**: 매질에 의한 빛의 흡수
+- **-∇·(D∇Φ)**: 매질 내에서의 빛의 확산 (확산 계수 D에 의해 결정)
+- **S(r,t)**: 광원 항 (시간 게이트 이미지는 광원이 꺼진 후 상태이므로 ≈ 0)
+
+#### 각 물리계수의 역할
+- **n (굴절률)**: 빛의 속도를 조절 (`c/n` = 매질 내 빛의 속도)
+- **μa (흡수 계수)**: 빛이 얼마나 흡수되는지 결정
+- **μs' (등방 환산 산란 계수)**: 빛이 얼마나 산란되는지 결정
+- **D (확산 계수)**: D = 1/(3*(μa + μs'))로 계산
+
+#### PINN에서의 활용
+- 예측된 물리계수 (`n_pred`, `μa_pred`, `μs'_pred`)를 방정식에 대입
+- 원본 이미지에서 계산된 물리량 (`Φ`, `∂Φ/∂t`, `∇²Φ`)을 방정식에 대입
+- 잔차(residual)를 계산하여 물리 법칙 만족 여부 검증
+
 ## 📁 저장소 구조
 
 ```
@@ -150,50 +393,159 @@ PICL/
 │   └── VMamba/                     # VMamba 소스 코드
 ├── mamba/                          # 서브모듈: 공식 Mamba 저장소
 │   └── mamba_ssm/                  # Mamba 소스 코드
-├── vmamba_backbone.py              # 시간 게이트 처리를 위한 수정된 VMamba
-├── mamba_1d_temporal.py            # 1D Mamba + 시퀀스-투-밸류
-├── picl_classification_experiment.py # 완전한 PICL 실험
+├── vmamba_backbone.py              # 2D VMamba 백본
+│   └── 시간 게이트 이미지 처리 지원
+│   └── 공간 특징 추출 (PATH 1에서 사용)
+├── mamba_1d_temporal.py            # 1D Mamba + SequenceToValue
+│   └── Mamba1D: 공식 1D Mamba 구현
+│   └── SequenceToValue: 시퀀스를 단일 벡터로 변환 (PATH 1에서 사용)
+├── pde_physics.py                  # 물리 방정식 및 PINN 손실
+│   └── TimeDependentDiffusionPDE: 시간 의존 확산 방정식 구현
+│   └── PINNPhysicsLoss: 데이터 손실 + 물리 손실 통합
+│   └── 물리량 계산 함수들 (시간 미분, 공간 미분 등)
+├── picl_model.py                   # 완전한 PICL 통합 모델
+│   └── PICLModel: PATH 1 + PATH 2 통합 클래스
+│   └── MLPRegressor: 물리계수 예측 헤드
+│   └── 전체 파이프라인 자동 실행
 ├── train/                          # 훈련 데이터셋
+│   ├── air_4D/images/             # 5장의 시간 게이트 이미지
+│   ├── water_4D/images/
+│   ├── acrylic_4D/images/
+│   ├── glass_4D/images/
+│   ├── sapphire_4D/images/
+│   └── dataset_labels.json         # 재료 라벨 및 굴절률
 ├── test/                           # 테스트 데이터셋
+│   └── ... (동일한 구조)
 └── README.md                       # 이 파일
 ```
 
 ## 🧪 주요 특징
 
-### 1. **시간 게이트 처리**
+### 1. **이중 경로 아키텍처 (Dual-Path Architecture)**
+- **PATH 1 (신경망)**: 2D VMamba → 1D Mamba → MLP → 물리계수 예측
+- **PATH 2 (물리)**: 원본 이미지 → 물리량 계산 → PDE 검증
+- **동시 실행**: 두 경로가 병렬로 실행되어 효율성 극대화
+
+### 2. **시간 게이트 처리**
 - 5장의 연속된 시간 게이트 이미지 처리 (0-1ns ~ 4-5ns)
-- 시간적 시퀀스 정보 유지
+- 시간적 시퀀스 정보 완전 보존
 - 물리 정보 기반 시간적 모델링 가능
 
-### 2. **공식 Mamba 구현**
+### 3. **물리 정보 기반 신경망 (PINN)**
+- **물리 방정식**: 시간 의존 확산 방정식 통합
+  ```
+  n/c * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = 0
+  ```
+- **이중 손실 함수**: 데이터 손실 + 물리 손실
+- **물리 법칙 검증**: 예측된 물리계수가 물리 법칙을 만족하는지 자동 검증
+
+### 4. **공식 Mamba 구현**
 - state-spaces/mamba 공식 구현 사용
+- 1D Mamba: 시간적 시퀀스 모델링
 - 긴 시퀀스에 대한 선형 복잡도
 - Transformer 대비 우수한 성능
 
-### 3. **시퀀스-투-밸류 아키텍처**
-- 시간적 시퀀스를 단일 예측으로 변환
-- 마지막 시간 스텝이 모든 이전 정보 포함
-- 재료 분류 작업에 최적화
+### 5. **물리량 계산 (유한 차분법)**
+- **시간 미분**: Forward Difference로 ∂Φ/∂t 계산
+- **공간 미분**: Central Difference로 ∇²Φ 계산
+- **효율적 계산**: GPU 병렬 처리로 전체 이미지 동시 계산
 
-### 4. **모듈화 설계**
-- 2D VMamba: 공간 특징 추출
-- 1D Mamba: 시간적 시퀀스 모델링
-- 분류 헤드: 재료 예측
+### 6. **모듈화 설계**
+- 2D VMamba: 공간 특징 추출 (`vmamba_backbone.py`)
+- 1D Mamba: 시간적 시퀀스 모델링 (`mamba_1d_temporal.py`)
+- 물리 방정식: PDE 계산 및 검증 (`pde_physics.py`)
+- 통합 모델: 전체 파이프라인 (`picl_model.py`)
 - 확장 및 수정 용이
 
 ## 📈 성능
 
 - **데이터셋**: 5개 재료 × 100개 훈련 샘플 × 50개 테스트 샘플
 - **입력**: 샘플당 5장의 시간 게이트 이미지 (224×224×3)
-- **출력**: 재료 분류 (5개 클래스)
-- **아키텍처**: VMamba + 1D Mamba + MLP
+- **출력**: 물리계수 예측
+  - 굴절률 (n): 1.0 ~ 1.77
+  - 흡수 계수 (μa): 0.01 ~ 0.1 mm⁻¹
+  - 등방 환산 산란 계수 (μs'): 0.5 ~ 2.0 mm⁻¹
+- **아키텍처**: VMamba + 1D Mamba + MLP Regressor + PINN 손실
+- **손실 함수**: Data Loss (MSE) + Physics Loss (PDE residual)
+
+## ✅ 구현 상태
+
+### 완료된 구현
+
+#### 핵심 모듈
+- ✅ **vmamba_backbone.py**: 2D VMamba 백본 (시간 게이트 처리 지원)
+- ✅ **mamba_1d_temporal.py**: 1D Mamba + SequenceToValue 구현
+- ✅ **pde_physics.py**: 
+  - ✅ 시간 의존 확산 방정식 구현
+  - ✅ 물리량 계산 함수 (시간 미분, 공간 미분)
+  - ✅ PDE 잔차 계산
+  - ✅ PINN 손실 함수 (데이터 손실 + 물리 손실)
+- ✅ **picl_model.py**: 
+  - ✅ 완전한 PICL 통합 모델
+  - ✅ PATH 1 (신경망 예측) + PATH 2 (물리량 계산) 통합
+  - ✅ 동시 실행 및 자동 손실 계산
+
+#### 기능
+- ✅ 3가지 물리계수 예측 (n, μa, μs')
+- ✅ 원본 이미지에서 물리량 계산
+- ✅ PDE 방정식 검증
+- ✅ 물리 손실 자동 계산
+
+### 미완성 / 향후 추가 필요
+
+- ❌ **훈련 스크립트**: 전체 훈련 루프
+- ❌ **데이터 로더**: PICL 데이터셋용 DataLoader
+- ❌ **평가 스크립트**: 물리계수 예측 평가 코드
+- ❌ **체크포인트 저장/로딩**: 모델 저장 기능
 
 ## 🔮 향후 연구
 
-1. **물리 손실 통합**: 헬름홀츠 방정식 제약 조건 추가
+1. ✅ **물리 손실 통합**: 시간 의존 확산 방정식 완료
 2. **연속 학습**: 순차적 재료 학습을 위한 FSCIL 구현
-3. **회귀**: 연속적인 굴절률 추정으로 확장
-4. **실시간 처리**: 실제 응용을 위한 최적화
+3. **공간 미분 개선**: 모든 시간 스텝에 대해 공간 미분 계산 (현재는 대표 시점만)
+4. **Source Term 모델링**: 광원 항(S)을 동적으로 예측하거나 더 정확히 모델링
+5. **실시간 처리**: 실제 응용을 위한 최적화
+6. **다중 물리 방정식**: 다른 물리 법칙 추가 통합
+
+## 🔑 핵심 개념 정리
+
+### 1. 왜 두 경로가 분리되어 있나?
+
+**PATH 1 (신경망)**: 물리계수를 예측하기 위해 특징을 추출하고 학습
+- VMamba로 공간 특징 추출 → 1D Mamba로 시간 처리 → MLP로 예측
+- 목적: 이미지에서 패턴을 학습하여 물리계수 예측
+
+**PATH 2 (물리)**: 예측된 물리계수가 물리 법칙을 만족하는지 검증
+- 원본 이미지에서 물리량 직접 계산 → PDE 방정식 검증
+- 목적: 물리 법칙 위반을 감지하고 수정
+
+**결합**: PATH 1의 예측값과 PATH 2의 계산값을 PDE 방정식에서 결합하여 물리 손실 계산
+
+### 2. 왜 원본 이미지를 직접 사용하나?
+
+- 물리량(`Φ`, `∂Φ/∂t`, `∇²Φ`)은 MCX 시뮬레이션의 직접적인 결과물
+- 공간 미분 계산에는 원본 이미지의 공간 정보가 필요
+- VMamba를 거친 특징맵은 추상화되어 물리량 계산에 부적합
+- PINN의 표준 관행: 관측 데이터(원본 이미지)를 직접 사용
+
+### 3. Residual이 4개인 이유
+
+- 5장의 이미지 → 4개의 시간 간격 (t1-t2, t2-t3, t3-t4, t4-t5)
+- 각 시간 간격마다 하나의 residual 계산
+- 최종 손실: 모든 residual의 평균 (`mean(residual^2)`)
+
+### 4. 공간 차원을 유지하는 이유
+
+- 물리 방정식에서 `Φ(r,t)`는 위치 `r`에 따라 변하는 함수
+- 각 픽셀(위치)마다 물리 법칙을 검증해야 함
+- 공간 미분(`∇²Φ`) 계산이 공간 차원 필요
+- 최종 손실은 모든 픽셀의 잔차를 평균내어 계산
+
+### 5. 물리 손실의 의미
+
+- `physics_loss ≈ 0`: 예측된 물리계수가 물리 법칙을 잘 만족 → 좋은 예측
+- `physics_loss > 0`: 예측된 물리계수가 물리 법칙을 위반 → 나쁜 예측
+- 물리 손실을 최소화하면 → 물리적으로 일관된 예측 가능
 
 ## 📚 참고문헌
 
@@ -201,19 +553,3 @@ PICL/
 - [VMamba: Visual State Space Model](https://arxiv.org/abs/2401.10166)
 - [FSCIL: Few-Shot Class-Incremental Learning](https://arxiv.org/abs/2004.10956)
 - [Physics-Informed Neural Networks](https://arxiv.org/abs/1711.10561)
-
-## 📄 라이선스
-
-이 프로젝트는 MIT 라이선스 하에 있습니다. 자세한 내용은 [LICENSE](LICENSE) 파일을 참조하세요.
-
-## 🤝 기여
-
-기여를 환영합니다! Pull Request를 자유롭게 제출해 주세요.
-
-## 📧 연락처
-
-질문이나 협업에 대해서는 연구팀에 연락해 주세요.
-
----
-
-**참고**: 이 저장소는 핵심 아키텍처와 구현에 중점을 둡니다. 완전한 물리 정보 기반 연속 학습 실험을 위해서는 추가 구성 요소(물리 손실, 연속 학습 전략)가 향후 버전에서 통합될 예정입니다.
