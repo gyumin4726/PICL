@@ -4,6 +4,6 @@
 [submodule "mamba"]
 	path = mamba
 	url = https://github.com/state-spaces/mamba.git
-[submodule "vmamba"]
-	path = vmamba
-	url = https://github.com/MzeroMiko/VMamba.git 
+[submodule "Vmamba"]
+	path = Vmamba
+	url = https://github.com/MzeroMiko/VMamba.git
