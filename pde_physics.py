@@ -5,7 +5,7 @@ Time-dependent Diffusion Equation Implementation
 This module implements the time-dependent diffusion equation for optical scattering
 in turbid media, which will be used as physics constraints in PINN training.
 
-Equation: c/n * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = S(r,t)
+Equation: n/c * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = S(r,t)
 
 Where:
 - Φ(r,t): Fluence rate (pixel values in MCX simulation images)
@@ -28,7 +28,7 @@ class TimeDependentDiffusionPDE:
     Time-dependent Diffusion Equation for Optical Scattering
     
     Implements the physics equation:
-    c/n * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = S(r,t)
+    n/c * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = S(r,t)
     
     This class provides methods to compute the PDE residual for PINN training.
     """
