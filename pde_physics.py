@@ -179,8 +179,13 @@ class TimeDependentDiffusionPDE:
         # Compute ∇·(D∇Φ) for representative time step (2nd image)
         center_idx = 1  # Use 2nd image (index 1) as representative
         phi_center = phi_sequence[:, center_idx]  # (B, H, W)
+        
+        # Expand D to match phi_center shape (B, H, W)
+        D_expanded = D.squeeze(1).squeeze(1).squeeze(1)  # (B,)
+        D_expanded = D_expanded.view(B, 1, 1).expand_as(phi_center)  # (B, H, W)
+        
         div_D_grad_phi_center = self.compute_gradient_divergence(
-            phi_center, D.squeeze(), dx, dy
+            phi_center, D_expanded, dx, dy
         )  # (B, H, W)
         
         # Expand to match time dimension for residual calculation

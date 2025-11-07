@@ -25,7 +25,7 @@ model = dict(
     # Physics Loss Configuration
     physics=dict(
         c=3e8,              # 광속 (m/s)
-        physics_weight=1.0, # Physics loss 가중치
+        physics_weight=10.0, # Physics loss 가중치
         data_weight=1.0,    # Data loss 가중치
     )
 )
@@ -59,7 +59,7 @@ data = dict(
 # Training Configuration
 # ========================
 train = dict(
-    epochs=100,
+    epochs=10,
     learning_rate=0.001,
     weight_decay=0.0001,
     
@@ -84,7 +84,7 @@ train = dict(
 # ========================
 # Runtime Configuration
 # ========================
-work_dir = './work_dirs/picl_vmamba_base'  # 작업 디렉토리
+work_dir = './work_dirs'  # 작업 디렉토리
 device = 'cuda'  # 'cuda' or 'cpu'
 seed = 42        # Random seed
 deterministic = True  # 재현성을 위한 deterministic 모드

@@ -155,11 +155,13 @@ class PICLModel(nn.Module):
         
         # 1. 2D VMamba: Extract spatial features
         x_flat = images.view(B * T, C, H, W)  # (B*T, C, H, W)
-        features = self.backbone(x_flat)  # Returns tuple
+        features = self.backbone(x_flat)  # Returns tuple or list
         
-        # Handle tuple output format
-        if isinstance(features, tuple):
-            features = features[0]  # Get the first element from tuple
+        # Handle tuple/list output format
+        if isinstance(features, (tuple, list)):
+            features = features[0]  # Get the first element
+        if isinstance(features, (tuple, list)):
+            features = features[0]  # Sometimes nested, get again
         
         # Global average pooling
         features = F.adaptive_avg_pool2d(features, (1, 1))  # (B*T, 1024, 1, 1)
@@ -239,7 +241,9 @@ class PICLModel(nn.Module):
             # 1. 2D VMamba
             x_flat = images.view(B * T, C, H, W)
             features = self.backbone(x_flat)
-            if isinstance(features, tuple):
+            if isinstance(features, (tuple, list)):
+                features = features[0]
+            if isinstance(features, (tuple, list)):
                 features = features[0]
             
             # Global pooling

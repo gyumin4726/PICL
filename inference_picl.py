@@ -54,7 +54,9 @@ def extract_features(model, images, device):
         x_flat = images.view(B * T, C, H, W)
         features = model.backbone(x_flat)
         
-        if isinstance(features, tuple):
+        if isinstance(features, (tuple, list)):
+            features = features[0]
+        if isinstance(features, (tuple, list)):
             features = features[0]
         
         # (B*T, C, H', W') -> (B, T, C, H', W')
