@@ -1,19 +1,15 @@
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../VMamba'))
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.runner import BaseModule
-from mmcls.models.builder import BACKBONES
 
-# Import VMamba modules
-from VMamba.vmamba import VSSM, Backbone_VSSM
+# Import VMamba modules (VMamba submodule at root)
+from VMamba.classification.models.vmamba import VSSM, Backbone_VSSM
 
 
-@BACKBONES.register_module()
-class VMambaBackbone(BaseModule):
+class VMambaBackbone(nn.Module):
     """VMamba backbone for FSCIL.
     
     This backbone integrates VMamba (Vision Mamba) as the feature extractor
@@ -112,7 +108,7 @@ class VMambaBackbone(BaseModule):
                  frozen_stages=-1,
                  channel_first=True,
                  init_cfg=None):
-        super(VMambaBackbone, self).__init__(init_cfg=init_cfg)
+        super(VMambaBackbone, self).__init__()
         
         self.model_name = model_name
         self.pretrained_path = pretrained_path
@@ -201,7 +197,7 @@ class VMambaBackbone(BaseModule):
     
     def train(self, mode=True):
         """Set training mode."""
-        super(VMambaBackbone, self).train(mode)
+        super().train(mode)
         self._freeze_stages()
         
     def init_weights(self):
