@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+PICL Training Script
+원본 이미지 -> VMamba Backbone -> Feature Maps 학습 파이프라인
+"""
+
+import os
+import sys
+import argparse
+import json
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import Adam, SGD, AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR
+from PIL import Image
+import numpy as np
+from tqdm import tqdm
+
+# PICL 모델 import
+from picl_model import PICLModel
+
+
+class OpticalScatteringDataset(Dataset):
+    """
+    4D 광학 산란 이미지 데이터셋
+    각 샘플: 5개의 시간 게이트 이미지 (B, 5, 3, 224, 224)
+    JSON 파일에서 레이블 정보를 로드합니다.
+    """
+    
+    def __init__(self, data_root, label_file, image_size=224, transform=None):
+        self.data_root = Path(data_root)
+        self.label_file = label_file
+        self.image_size = image_size
+        self.transform = transform
+        
+        # JSON 파일에서 데이터 로드
+        self.samples = []
+        self._load_from_json()
+    
+    def _load_from_json(self):
+        """JSON 파일에서 데이터 샘플 로드"""
+        with open(self.label_file, 'r') as f:
+            dataset_info = json.load(f)
+        
+        # 각 샘플에 대해 이미지 경로 구성
+        for sample in dataset_info['samples']:
+            sample_id = sample['sample_id']
+            material = sample['material']
+            n_value = sample['refractive_index']
+            base_path = sample['base_path']
+            
+            # 5개의 시간 게이트 이미지 경로 생성
+            # 실제 구조: air_4D/images/air001/air001_1.png ~ air001_5.png
+            time_gates = []
+            for gate_idx in range(1, 6):  # 1~5
+                img_path = self.data_root / base_path / f"{sample_id}_{gate_idx}.png"
+                time_gates.append(img_path)
+            
+            # 모든 이미지가 존재하는지 확인
+            if all(img_path.exists() for img_path in time_gates):
+                self.samples.append({
+                    'images': time_gates,
+                    'class': material,
+                    'n_true': n_value,
+                    'sample_id': sample_id
+                })
+        
+        print(f"Loaded {len(self.samples)} samples from {self.label_file}")
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
+        # 5개의 시간 게이트 이미지 로드 (시퀀스)
+        images = []
+        for img_path in sample['images']:
+            img = Image.open(img_path).convert('RGB')
+            img = img.resize((self.image_size, self.image_size))
+            img = np.array(img) / 255.0  # Normalize to [0, 1]
+            images.append(img)
+        
+        images = np.stack(images, axis=0)  # (5, H, W, 3) - 5개 시퀀스
+        images = torch.from_numpy(images).float()
+        images = images.permute(0, 3, 1, 2)  # (5, 3, H, W) - [시퀀스, 채널, H, W]
+        
+        n_true = torch.tensor(sample['n_true'], dtype=torch.float32)
+        
+        # 5개 시퀀스 => 1개 예측값
+        return images, n_true, sample['class']
+
+
+def load_config(config_path):
+    """Config 파일 로드"""
+    config = {}
+    with open(config_path, 'r') as f:
+        exec(f.read(), config)
+    
+    # dict 타입만 추출
+    config = {k: v for k, v in config.items() if isinstance(v, dict) and not k.startswith('_')}
+    return config
+
+
+def build_optimizer(model, config):
+    """Optimizer 생성"""
+    opt_type = config['train']['optimizer']
+    lr = config['train']['learning_rate']
+    wd = config['train']['weight_decay']
+    
+    if opt_type == 'Adam':
+        optimizer = Adam(model.parameters(), lr=lr, weight_decay=wd)
+    elif opt_type == 'SGD':
+        optimizer = SGD(model.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
+    elif opt_type == 'AdamW':
+        optimizer = AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    else:
+        raise ValueError(f"Unknown optimizer: {opt_type}")
+    
+    return optimizer
+
+
+def build_scheduler(optimizer, config):
+    """Learning rate scheduler 생성"""
+    sched_type = config['train']['scheduler']
+    params = config['train']['scheduler_params']
+    
+    if sched_type == 'CosineAnnealing':
+        scheduler = CosineAnnealingLR(optimizer, T_max=params['T_max'], eta_min=params['eta_min'])
+    elif sched_type == 'StepLR':
+        scheduler = StepLR(optimizer, step_size=params['step_size'], gamma=params['gamma'])
+    elif sched_type == 'MultiStepLR':
+        scheduler = MultiStepLR(optimizer, milestones=params['milestones'], gamma=params['gamma'])
+    else:
+        raise ValueError(f"Unknown scheduler: {sched_type}")
+    
+    return scheduler
+
+
+def train_epoch(model, dataloader, optimizer, device, epoch):
+    """1 epoch 학습"""
+    model.train()
+    total_loss = 0
+    total_data_loss = 0
+    total_physics_loss = 0
+    
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    for images, n_true, class_names in pbar:
+        images = images.to(device)
+        n_true = n_true.to(device)
+        
+        # Forward pass
+        results = model(images, n_true)
+        
+        loss = results['total_loss']
+        data_loss = results['data_loss']
+        physics_loss = results['physics_loss']
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # 통계
+        total_loss += loss.item()
+        total_data_loss += data_loss.item()
+        total_physics_loss += physics_loss.item()
+        
+        pbar.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'data': f"{data_loss.item():.4f}",
+            'physics': f"{physics_loss.item():.4f}"
+        })
+    
+    avg_loss = total_loss / len(dataloader)
+    avg_data_loss = total_data_loss / len(dataloader)
+    avg_physics_loss = total_physics_loss / len(dataloader)
+    
+    return avg_loss, avg_data_loss, avg_physics_loss
+
+
+def validate(model, dataloader, device):
+    """검증"""
+    model.eval()
+    total_loss = 0
+    predictions = []
+    ground_truths = []
+    
+    with torch.no_grad():
+        for images, n_true, class_names in tqdm(dataloader, desc="Validating"):
+            images = images.to(device)
+            n_true = n_true.to(device)
+            
+            # Forward pass
+            results = model(images, n_true)
+            
+            total_loss += results['total_loss'].item()
+            predictions.extend(results['n_pred'].cpu().numpy())
+            ground_truths.extend(n_true.cpu().numpy())
+    
+    avg_loss = total_loss / len(dataloader)
+    predictions = np.array(predictions)
+    ground_truths = np.array(ground_truths)
+    
+    # MSE 계산
+    mse = np.mean((predictions - ground_truths) ** 2)
+    
+    return avg_loss, mse, predictions, ground_truths
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Train PICL Model')
+    parser.add_argument('config', type=str, help='Config file path')
+    parser.add_argument('--work-dir', type=str, default=None, help='Working directory')
+    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
+    args = parser.parse_args()
+    
+    # Config 로드
+    config = load_config(args.config)
+    
+    # Work directory 설정
+    work_dir = args.work_dir if args.work_dir else config['work_dir']
+    os.makedirs(work_dir, exist_ok=True)
+    
+    # Device 설정
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # 데이터셋 생성
+    print("\n=== Loading Dataset ===")
+    train_dataset = OpticalScatteringDataset(
+        data_root=config['data']['train']['data_root'],
+        label_file=config['data']['train']['label_file'],
+        image_size=config['data']['train']['image_size']
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['data']['train']['batch_size'],
+        shuffle=config['data']['train']['shuffle'],
+        num_workers=config['data']['train']['num_workers']
+    )
+    
+    # 모델 생성
+    print("\n=== Building Model ===")
+    model = PICLModel(
+        backbone_model=config['model']['backbone']['model_name'],
+        pretrained_path=config['model']['backbone']['pretrained_path'],
+        temporal_config={
+            'input_dim': config['model']['temporal']['input_dim'],
+            'd_model': config['model']['temporal']['d_model'],
+            'device': device
+        },
+        physics_config=config['model']['physics']
+    )
+    model = model.to(device)
+    
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Optimizer & Scheduler
+    optimizer = build_optimizer(model, config)
+    scheduler = build_scheduler(optimizer, config)
+    
+    # Resume
+    start_epoch = 0
+    best_loss = float('inf')
+    if args.resume:
+        checkpoint = torch.load(args.resume)
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = checkpoint['epoch']
+        best_loss = checkpoint['best_loss']
+        print(f"Resumed from epoch {start_epoch}")
+    
+    # 학습
+    print("\n=== Training ===")
+    for epoch in range(start_epoch, config['train']['epochs']):
+        # Train
+        avg_loss, avg_data_loss, avg_physics_loss = train_epoch(
+            model, train_loader, optimizer, device, epoch
+        )
+        
+        print(f"\nEpoch {epoch}:")
+        print(f"  Train Loss: {avg_loss:.4f}")
+        print(f"  Data Loss: {avg_data_loss:.4f}")
+        print(f"  Physics Loss: {avg_physics_loss:.4f}")
+        print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+        
+        # Scheduler step
+        scheduler.step()
+        
+        # 체크포인트 저장
+        if (epoch + 1) % config['train']['save_interval'] == 0:
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'best_loss': best_loss
+            }
+            torch.save(checkpoint, os.path.join(work_dir, f'epoch_{epoch+1}.pth'))
+        
+        # Best model 저장
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'best_loss': best_loss
+            }
+            torch.save(checkpoint, os.path.join(work_dir, 'best.pth'))
+            print(f"  ✓ Best model saved!")
+    
+    print("\n=== Training Complete ===")
+    print(f"Best loss: {best_loss:.4f}")
+    print(f"Models saved in: {work_dir}")
+
+
+if __name__ == '__main__':
+    main()
+

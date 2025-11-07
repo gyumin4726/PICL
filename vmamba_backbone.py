@@ -1,6 +1,6 @@
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), './VMamba'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../VMamba'))
 
 import torch
 import torch.nn as nn
@@ -184,50 +184,20 @@ class VMambaBackbone(BaseModule):
         """Forward function.
         
         Args:
-            x (Tensor): Input tensor of shape (B, 3, H, W) or (B, T, 3, H, W)
-                       - Single image: (B, 3, H, W)
-                       - Time-gate batch: (B, T, 3, H, W)
+            x (Tensor): Input tensor of shape (B, 3, H, W)
             
         Returns:
             tuple: Multi-scale feature maps from different stages
-                - Single image: (B, dims[i], H_i, W_i)
-                - Time-gate batch: (B, T, dims[i], H_i, W_i)
+                - For out_indices=(0,1,2,3): returns (stage1, stage2, stage3, stage4)
+                - Each stage output shape: (B, dims[i], H_i, W_i)
         """
-        # Check if input is time-gate batch (5D) or single image (4D)
-        if x.dim() == 5:  # Time-gate batch: (B, T, C, H, W)
-            B, T, C, H, W = x.shape
-            
-            # Reshape to process all images at once
-            x_flat = x.view(B * T, C, H, W)  # (B*T, C, H, W)
-            
-            # Process through VMamba
-            features_flat = self.vmamba(x_flat)  # (B*T, dims[i], H_i, W_i)
-            
-            # Reshape back to batch format
-            if len(self.out_indices) == 1:
-                # Single output: (B*T, dims[i], H_i, W_i) -> (B, T, dims[i], H_i, W_i)
-                if isinstance(features_flat, (tuple, list)):
-                    features_flat = features_flat[0]  # Get the first element
-                features = features_flat.view(B, T, *features_flat.shape[1:])
-                return (features,)
-            else:
-                # Multiple outputs: tuple of (B, T, dims[i], H_i, W_i)
-                features_list = []
-                for feat in features_flat:
-                    if isinstance(feat, (tuple, list)):
-                        feat = feat[0]  # Get the first element
-                    feat_reshaped = feat.view(B, T, *feat.shape[1:])
-                    features_list.append(feat_reshaped)
-                return tuple(features_list)
+        features = self.vmamba(x)
         
-        else:  # Single image: (B, C, H, W)
-            features = self.vmamba(x)
-            
-            # If only one output index, return as tuple for consistency
-            if len(self.out_indices) == 1:
-                return (features,)
-            
-            return tuple(features)
+        # If only one output index, return as tuple for consistency
+        if len(self.out_indices) == 1:
+            return (features,)
+        
+        return tuple(features)
     
     def train(self, mode=True):
         """Set training mode."""
