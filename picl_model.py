@@ -349,7 +349,6 @@ class PICLModel(nn.Module):
         self.regressor = MLPRegressor(
             input_dim=temporal_config['d_model'],
             hidden_dim=256,
-            num_classes=3,  # n, μa, μs'
             dropout=0.5
         )
         

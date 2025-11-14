@@ -182,7 +182,8 @@ def inference_on_dataset(model, dataset, device, save_dir):
         confusion[r['material_true']][r['material_pred']] += 1
     
     # Print header
-    print(f"{'True \\ Pred':<12}", end="")
+    header_label = "True \\ Pred"
+    print(f"{header_label:<12}", end="")
     for mat in materials:
         print(f"{mat:<10}", end="")
     print()
