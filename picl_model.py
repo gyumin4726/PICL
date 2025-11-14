@@ -8,9 +8,11 @@ This module implements the complete PICL pipeline that simultaneously:
 3. Validates physics constraints using PDE equations
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Tuple, Dict, Optional
 
 # Import our modules
@@ -19,47 +21,271 @@ from mamba_1d_temporal import SequenceToValue
 from pde_physics import PINNPhysicsLoss
 
 
+def generate_random_orthogonal_matrix(feat_in: int, num_classes: int) -> torch.Tensor:
+    """
+    Generate a random orthogonal matrix using QR decomposition.
+    
+    This function is adopted from FSCIL's ETFHead implementation.
+    
+    Args:
+        feat_in (int): Input feature dimension
+        num_classes (int): Number of classes (output dimension)
+        
+    Returns:
+        torch.Tensor: Orthogonal matrix of shape (feat_in, num_classes)
+    """
+    rand_mat = np.random.random(size=(feat_in, num_classes))
+    orth_vec, _ = np.linalg.qr(rand_mat)  # QR decomposition
+    orth_vec = torch.tensor(orth_vec).float()
+    
+    # Verify orthogonality
+    assert torch.allclose(
+        torch.matmul(orth_vec.T, orth_vec), 
+        torch.eye(num_classes), 
+        atol=1.e-7
+    ), "The max irregular value is : {}".format(
+        torch.max(torch.abs(torch.matmul(orth_vec.T, orth_vec) - torch.eye(num_classes)))
+    )
+    
+    return orth_vec
+
+
 class MLPRegressor(nn.Module):
     """
-    MLP Regressor for Physical Coefficients Prediction.
+    MLP Regressor for Physical Coefficients Prediction with Separate Heads.
     
-    Predicts 3 physical coefficients: refractive index (n), 
-    absorption coefficient (μa), and reduced scattering coefficient (μs').
+    Uses multi-task learning architecture:
+    - Shared backbone: Learns common features from temporal representations
+    - Separate heads: Independently predict each physical coefficient
+    
+    This design avoids gradient conflicts between coefficients with different:
+    - Value scales: n ∈ [1.0, 1.8], μₐ ∈ [0.001, 10], μₛ' ∈ [0.1, 10]
+    - Supervision strength: n has Data Loss, μₐ/μₛ' only have Physics Loss
+    
+    Architecture:
+        Input (B, 512)
+            ↓
+        Shared MLP: 512 → 256 (common features)
+            ↓
+            ├─→ Head_n:  256 → 1 (refractive index)
+            ├─→ Head_μₐ: 256 → 1 (absorption coefficient)
+            └─→ Head_μₛ': 256 → 1 (reduced scattering coefficient)
+    
+    Args:
+        input_dim (int): Input feature dimension (default: 512)
+        hidden_dim (int): Shared backbone output dimension (default: 256)
+        dropout (float): Dropout rate for regularization (default: 0.5)
     """
     
-    def __init__(self, input_dim: int = 512, hidden_dim: int = 256, 
-                 num_classes: int = 3, dropout: float = 0.5):
+    def __init__(self, input_dim: int = 512, hidden_dim: int = 256, dropout: float = 0.5):
         super().__init__()
         
-        self.classifier = nn.Sequential(
+        # Shared backbone for common feature extraction
+        self.shared_backbone = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes)
+            nn.Dropout(dropout)
         )
+        
+        # Separate heads for each physical coefficient
+        self.head_n = nn.Linear(hidden_dim, 1)           # Refractive index
+        self.head_mu_a = nn.Linear(hidden_dim, 1)        # Absorption coefficient
+        self.head_mu_s_prime = nn.Linear(hidden_dim, 1)  # Reduced scattering coefficient
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for physical coefficients prediction.
+        
+        Process:
+        1. Extract common features via shared backbone
+        2. Independently predict each coefficient via separate heads
         
         Args:
             x (torch.Tensor): Input features (B, input_dim)
             
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
-                (n_pred, mu_a_pred, mu_s_prime_pred)
+                - n_pred: (B,) Refractive index [1.0 ~ 1.8]
+                - mu_a_pred: (B,) Absorption coefficient [0.001 ~ 10]
+                - mu_s_prime_pred: (B,) Reduced scattering coefficient [0.1 ~ 10]
         """
-        output = self.classifier(x)  # (B, 3)
+        # Shared feature extraction
+        shared_features = self.shared_backbone(x)  # (B, hidden_dim)
         
-        # Split into individual coefficients
-        n_pred = output[:, 0]           # Refractive index
-        mu_a_pred = output[:, 1]        # Absorption coefficient  
-        mu_s_prime_pred = output[:, 2]  # Reduced scattering coefficient
+        # Independent predictions for each coefficient
+        n_pred = self.head_n(shared_features).squeeze(-1)              # (B,)
+        mu_a_pred = self.head_mu_a(shared_features).squeeze(-1)        # (B,)
+        mu_s_prime_pred = self.head_mu_s_prime(shared_features).squeeze(-1)  # (B,)
         
         return n_pred, mu_a_pred, mu_s_prime_pred
+
+
+class ETFClassifier(nn.Module):
+    """
+    Equiangular Tight Frame (ETF) Classifier for Material Classification.
+    
+    ETF Classifier는 고정된 기하학적 구조를 가진 classifier로,
+    모든 클래스 간의 각도가 동일하여 few-shot learning에 유리합니다.
+    
+    This implementation follows FSCIL's ETFHead with proper ETF construction:
+    W_ETF = √(C/(C-1)) × orth_vec × (I - 1/C × 11^T)
+    
+    Architecture:
+    - Input: (B, 3) - Physical coefficients [n, μₐ, μₛ']
+    - Feature Extractor: 3 → 64 → 32 (learnable, for low-dim input expansion)
+    - ETF Head: Fixed orthogonal weights (non-learnable, bias-free)
+    - Output: (B, num_classes) - Class logits
+    
+    Materials:
+        0: air
+        1: water
+        2: acrylic
+        3: glass
+        4: sapphire
+    
+    Key Features:
+    - Equiangular geometry: All class pairs have equal angular separation
+    - QR decomposition: Ensures proper orthogonality
+    - Scale factor: √(C/(C-1)) for correct simplex geometry
+    - Few-shot friendly: Strong geometric prior reduces overfitting
+    
+    Args:
+        num_classes (int): Number of material classes (default: 5)
+        input_dim (int): Dimension of physical coefficients (default: 3)
+        hidden_dims (tuple): Hidden layer dimensions (default: (64, 32))
+    """
+    
+    def __init__(self, num_classes: int = 5, input_dim: int = 3, 
+                 hidden_dims: tuple = (64, 32)):
+        super().__init__()
+        
+        self.num_classes = num_classes
+        self.input_dim = input_dim
+        
+        # Feature extractor (learnable)
+        layers = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.ReLU(),
+                nn.BatchNorm1d(hidden_dim)
+            ])
+            prev_dim = hidden_dim
+        
+        self.feature_extractor = nn.Sequential(*layers)
+        self.feature_dim = prev_dim
+        
+        # ETF Classifier Head (fixed, not learnable)
+        self.etf_head = self._create_etf_weights(num_classes, self.feature_dim)
+        
+    def _create_etf_weights(self, num_classes: int, feature_dim: int) -> nn.Parameter:
+        """
+        Create Equiangular Tight Frame (ETF) weights using FSCIL method.
+        
+        FSCIL ETF 구조:
+        W_ETF = √(C/(C-1)) × orth_vec × (I - 1/C × 11^T)
+        
+        여기서:
+        - C: 클래스 수
+        - I: Identity matrix (C × C)
+        - 1: ones matrix (C × C)
+        - orth_vec: Random orthogonal matrix (D × C) from QR decomposition
+        - 모든 클래스 쌍의 내적이 -1/(C-1)로 동일
+        
+        This implementation follows FSCIL's ETFHead for mathematical correctness.
+        
+        Args:
+            num_classes (int): Number of classes (C)
+            feature_dim (int): Feature dimension (D)
+            
+        Returns:
+            nn.Parameter: Fixed ETF weights (feature_dim, num_classes)
+        """
+        # 1. Generate random orthogonal matrix using QR decomposition
+        orth_vec = generate_random_orthogonal_matrix(feature_dim, num_classes)
+        # orth_vec shape: (feature_dim, num_classes) = (D, C)
+        
+        # 2. Create ETF transformation matrix
+        i_nc_nc = torch.eye(num_classes)  # Identity (C × C)
+        one_nc_nc = torch.ones(num_classes, num_classes) / num_classes  # (C × C)
+        
+        # 3. Apply ETF formula
+        # Scale factor: √(C/(C-1)) - CORRECT formula from FSCIL
+        scale = math.sqrt(num_classes / (num_classes - 1))
+        
+        # ETF = orth_vec @ (I - 1/C × 11^T)
+        # Shape: (D, C) @ (C, C) = (D, C)
+        etf_vec = torch.matmul(orth_vec, i_nc_nc - one_nc_nc)
+        etf_vec = etf_vec * scale
+        
+        # 4. Register as non-trainable parameter
+        # Transpose to (num_classes, feature_dim) for F.linear
+        etf_weights = nn.Parameter(etf_vec.T, requires_grad=False)
+        
+        return etf_weights
+    
+    def forward(self, physical_coeffs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for material classification using ETF geometry.
+        
+        Process:
+        1. Extract features: (B, 3) → (B, 32) using learnable MLP
+        2. L2 normalize: Required for ETF geometry (projects onto hypersphere)
+        3. Compute logits: features @ W_ETF^T (bias-free linear)
+        4. Predict class: argmax over logits
+        
+        Args:
+            physical_coeffs (torch.Tensor): Physical coefficients (B, 3) - [n, μₐ, μₛ']
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - class_logits: (B, num_classes) - Class logits (not probabilities)
+                - class_pred: (B,) - Predicted class indices [0-4]
+        """
+        # 1. Extract features from physical coefficients (3 → 32 dimensions)
+        features = self.feature_extractor(physical_coeffs)  # (B, feature_dim)
+        
+        # 2. L2 normalize features (CRITICAL for ETF geometry)
+        # Projects features onto unit hypersphere
+        features = F.normalize(features, p=2, dim=1)  # (B, feature_dim), ||f|| = 1
+        
+        # 3. Compute logits using fixed ETF weights (bias-free)
+        # Dot product: cosine similarity with each class prototype
+        # logits = features @ W_ETF^T
+        class_logits = F.linear(features, self.etf_head, bias=None)  # (B, num_classes)
+        
+        # 4. Get predicted class (argmax)
+        class_pred = torch.argmax(class_logits, dim=1)  # (B,)
+        
+        return class_logits, class_pred
+    
+    def get_etf_structure(self) -> torch.Tensor:
+        """
+        Return the ETF weight matrix for visualization.
+        
+        Returns:
+            torch.Tensor: ETF weights (num_classes, feature_dim)
+        """
+        return self.etf_head.data
+    
+    def compute_class_similarity(self) -> torch.Tensor:
+        """
+        Compute pairwise cosine similarity between class vectors.
+        
+        For perfect ETF structure, all off-diagonal elements should be -1/(C-1).
+        
+        Returns:
+            torch.Tensor: Similarity matrix (num_classes, num_classes)
+        """
+        W = self.etf_head.data  # (C, D)
+        W_norm = F.normalize(W, p=2, dim=1)  # Normalize rows
+        similarity = torch.mm(W_norm, W_norm.T)  # (C, C)
+        
+        return similarity
 
 
 class PICLModel(nn.Module):
@@ -83,7 +309,8 @@ class PICLModel(nn.Module):
                  backbone_model: str = 'vmamba_base_s2l15',
                  pretrained_path: Optional[str] = None,
                  temporal_config: Optional[dict] = None,
-                 physics_config: Optional[dict] = None):
+                 physics_config: Optional[dict] = None,
+                 num_classes: int = 5):
         super().__init__()
         
         # Default configurations
@@ -98,6 +325,7 @@ class PICLModel(nn.Module):
             physics_config = {
                 'physics_weight': 1.0,
                 'data_weight': 1.0,
+                'classification_weight': 10.0,  # Classification is primary goal
                 'c': 3e8
             }
         
@@ -118,14 +346,21 @@ class PICLModel(nn.Module):
         )
         
         # 3. MLP Regressor (Physical Coefficients Predictor)
-        self.classifier = MLPRegressor(
+        self.regressor = MLPRegressor(
             input_dim=temporal_config['d_model'],
             hidden_dim=256,
             num_classes=3,  # n, μa, μs'
             dropout=0.5
         )
         
-        # 4. Physics Loss Module
+        # 4. ETF Classifier (Material Classification from Physical Coefficients)
+        self.classifier = ETFClassifier(
+            num_classes=num_classes,  # 5 materials
+            input_dim=3,  # n, μa, μs'
+            hidden_dims=(64, 32)
+        )
+        
+        # 5. Physics Loss Module
         self.physics_loss = PINNPhysicsLoss(
             c=physics_config['c'],
             physics_weight=physics_config['physics_weight'],
@@ -135,14 +370,17 @@ class PICLModel(nn.Module):
         # Store configurations
         self.temporal_config = temporal_config
         self.physics_config = physics_config
+        self.num_classes = num_classes
     
-    def forward(self, images: torch.Tensor, n_true: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, images: torch.Tensor, n_true: torch.Tensor, 
+                material_label: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Complete PICL forward pass with simultaneous processing.
         
         Args:
             images (torch.Tensor): Original image sequence (B, 5, 3, 224, 224)
             n_true (torch.Tensor): True refractive index (B,)
+            material_label (torch.Tensor, optional): True material labels (B,) [0-4]
             
         Returns:
             Dict[str, torch.Tensor]: Complete results including predictions and losses
@@ -174,7 +412,11 @@ class PICLModel(nn.Module):
         temporal_features = self.temporal(features)  # (B, 512)
         
         # 3. MLP Regressor: Predict physical coefficients
-        n_pred, mu_a_pred, mu_s_prime_pred = self.classifier(temporal_features)
+        n_pred, mu_a_pred, mu_s_prime_pred = self.regressor(temporal_features)
+        
+        # 4. ETF Classifier: Material classification from physical coefficients
+        physical_coeffs = torch.stack([n_pred, mu_a_pred, mu_s_prime_pred], dim=1)  # (B, 3)
+        class_logits, class_pred = self.classifier(physical_coeffs)  # (B, num_classes), (B,)
         
         # ========================================
         # PATH 2: Physics Quantities Computation
@@ -187,11 +429,11 @@ class PICLModel(nn.Module):
             phi_sequence = images  # Already grayscale
         
         # ========================================
-        # PATH 3: Physics Loss Computation
+        # PATH 3: Loss Computation
         # ========================================
         
-        # Compute combined PINN loss
-        total_loss, loss_dict = self.physics_loss(
+        # 3.1. Physics Loss (Data + PDE)
+        pinn_loss, loss_dict = self.physics_loss(
             phi_original=phi_sequence,      # Original images for physics
             n_pred=n_pred,                  # Predicted refractive index
             n_true=n_true,                  # True refractive index
@@ -200,21 +442,41 @@ class PICLModel(nn.Module):
             dx=1.0, dy=1.0, dt=1.0         # Spatial and temporal steps
         )
         
+        # 3.2. Classification Loss
+        classification_loss = torch.tensor(0.0, device=images.device)
+        if material_label is not None:
+            classification_loss = F.cross_entropy(class_logits, material_label)
+        
+        # 3.3. Total Loss
+        w_cls = self.physics_config.get('classification_weight', 10.0)
+        w_data = self.physics_config.get('data_weight', 1.0)
+        w_physics = self.physics_config.get('physics_weight', 1.0)
+        
+        total_loss = (w_cls * classification_loss + 
+                     w_data * loss_dict['data_loss'] + 
+                     w_physics * loss_dict['physics_loss'])
+        
         # ========================================
         # RETURN COMPLETE RESULTS
         # ========================================
         
         results = {
-            # Predictions
+            # Predictions - Physical Coefficients
             'n_pred': n_pred,
             'mu_a_pred': mu_a_pred,
             'mu_s_prime_pred': mu_s_prime_pred,
             
+            # Predictions - Classification
+            'class_logits': class_logits,
+            'class_pred': class_pred,
+            
             # Features
             'temporal_features': temporal_features,
+            'physical_coeffs': physical_coeffs,
             
             # Losses
             'total_loss': total_loss,
+            'classification_loss': classification_loss,
             'data_loss': loss_dict['data_loss'],
             'physics_loss': loss_dict['physics_loss'],
             
@@ -255,9 +517,34 @@ class PICLModel(nn.Module):
             temporal_features = self.temporal(features)
             
             # 3. MLP Regressor
-            n_pred, mu_a_pred, mu_s_prime_pred = self.classifier(temporal_features)
+            n_pred, mu_a_pred, mu_s_prime_pred = self.regressor(temporal_features)
             
             return n_pred, mu_a_pred, mu_s_prime_pred
+    
+    def predict_material(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Predict material classification and physical coefficients.
+        
+        Args:
+            images (torch.Tensor): Image sequence (B, 5, 3, 224, 224)
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
+                - class_logits: (B, num_classes) - Class probabilities
+                - class_pred: (B,) - Predicted class indices
+                - physical_coeffs: (B, 3) - [n, μₐ, μₛ']
+        """
+        with torch.no_grad():
+            # Get physical coefficients
+            n_pred, mu_a_pred, mu_s_prime_pred = self.predict_coefficients(images)
+            
+            # Stack coefficients
+            physical_coeffs = torch.stack([n_pred, mu_a_pred, mu_s_prime_pred], dim=1)  # (B, 3)
+            
+            # Classify material
+            class_logits, class_pred = self.classifier(physical_coeffs)
+            
+            return class_logits, class_pred, physical_coeffs
 
 
 def test_picl_model():

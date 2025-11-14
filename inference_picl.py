@@ -28,7 +28,8 @@ def load_model(config, checkpoint_path, device):
             'd_model': config['model']['temporal']['d_model'],
             'device': device
         },
-        physics_config=config['model']['physics']
+        physics_config=config['model']['physics'],
+        num_classes=config['model']['num_classes']
     )
     
     # 체크포인트 로드
@@ -79,28 +80,55 @@ def predict_coefficients(model, images, device):
     }
 
 
+def predict_material(model, images, device):
+    """재료 분류 및 물리 계수 예측"""
+    with torch.no_grad():
+        images = images.to(device)
+        class_logits, class_pred, physical_coeffs = model.predict_material(images)
+    
+    # Softmax for probabilities
+    import torch.nn.functional as F
+    class_probs = F.softmax(class_logits, dim=1)
+    
+    return {
+        'class_pred': class_pred.cpu().numpy(),
+        'class_probs': class_probs.cpu().numpy(),
+        'n': physical_coeffs[:, 0].cpu().numpy(),
+        'mu_a': physical_coeffs[:, 1].cpu().numpy(),
+        'mu_s_prime': physical_coeffs[:, 2].cpu().numpy()
+    }
+
+
 def inference_on_dataset(model, dataset, device, save_dir):
     """데이터셋 전체에 대해 추론"""
     results = []
     
     print("\n=== Running Inference ===")
     for idx in tqdm(range(len(dataset))):
-        images, n_true, class_name = dataset[idx]
+        images, n_true, material_label = dataset[idx]
         images = images.unsqueeze(0)  # Add batch dimension
         
-        # 물리 계수 예측
-        coeffs = predict_coefficients(model, images, device)
+        # 재료 분류 및 물리 계수 예측
+        preds = predict_material(model, images, device)
         
         # 피처맵 추출
         features = extract_features(model, images, device)
         
+        # Material name mapping
+        material_label_idx = int(material_label.numpy())
+        material_name = OpticalScatteringDataset.IDX_TO_MATERIAL.get(material_label_idx, 'unknown')
+        pred_material_idx = int(preds['class_pred'][0])
+        pred_material_name = OpticalScatteringDataset.IDX_TO_MATERIAL.get(pred_material_idx, 'unknown')
+        
         result = {
             'idx': idx,
-            'class': class_name,
+            'material_true': material_name,
+            'material_pred': pred_material_name,
+            'class_probs': preds['class_probs'][0].tolist(),
             'n_true': float(n_true.numpy()),
-            'n_pred': float(coeffs['n'][0]),
-            'mu_a_pred': float(coeffs['mu_a'][0]),
-            'mu_s_prime_pred': float(coeffs['mu_s_prime'][0]),
+            'n_pred': float(preds['n'][0]),
+            'mu_a_pred': float(preds['mu_a'][0]),
+            'mu_s_prime_pred': float(preds['mu_s_prime'][0]),
             'feature_shape': list(features.shape)
         }
         results.append(result)
@@ -112,24 +140,61 @@ def inference_on_dataset(model, dataset, device, save_dir):
     mse = np.mean([(t - p)**2 for t, p in zip(n_true_list, n_pred_list)])
     mae = np.mean([abs(t - p) for t, p in zip(n_true_list, n_pred_list)])
     
+    # Classification accuracy
+    correct = sum(1 for r in results if r['material_true'] == r['material_pred'])
+    accuracy = 100.0 * correct / len(results)
+    
     print(f"\n=== Results ===")
     print(f"Total samples: {len(results)}")
-    print(f"MSE (n): {mse:.6f}")
-    print(f"MAE (n): {mae:.6f}")
+    print(f"\n📊 Classification:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{len(results)})")
+    print(f"\n📐 Regression (Refractive Index):")
+    print(f"  MSE: {mse:.6f}")
+    print(f"  MAE: {mae:.6f}")
     
     # 클래스별 통계
-    print(f"\n=== Class-wise Results ===")
-    classes = set([r['class'] for r in results])
-    for cls in sorted(classes):
-        cls_results = [r for r in results if r['class'] == cls]
-        cls_n_true = [r['n_true'] for r in cls_results]
-        cls_n_pred = [r['n_pred'] for r in cls_results]
-        cls_mse = np.mean([(t - p)**2 for t, p in zip(cls_n_true, cls_n_pred)])
-        cls_mae = np.mean([abs(t - p) for t, p in zip(cls_n_true, cls_n_pred)])
+    print(f"\n=== Material-wise Results ===")
+    materials = sorted(set([r['material_true'] for r in results]))
+    
+    # Header
+    print(f"{'Material':<12} {'Count':<7} {'Accuracy':<10} {'n_true':<8} {'n_pred':<15} {'MSE':<10} {'MAE':<10}")
+    print("-" * 90)
+    
+    for mat in materials:
+        mat_results = [r for r in results if r['material_true'] == mat]
+        mat_correct = sum(1 for r in mat_results if r['material_true'] == r['material_pred'])
+        mat_accuracy = 100.0 * mat_correct / len(mat_results)
         
-        print(f"{cls:12s}: n_true={cls_n_true[0]:.2f}, "
-              f"n_pred_avg={np.mean(cls_n_pred):.4f}±{np.std(cls_n_pred):.4f}, "
-              f"MSE={cls_mse:.6f}, MAE={cls_mae:.6f}")
+        mat_n_true = [r['n_true'] for r in mat_results]
+        mat_n_pred = [r['n_pred'] for r in mat_results]
+        mat_mse = np.mean([(t - p)**2 for t, p in zip(mat_n_true, mat_n_pred)])
+        mat_mae = np.mean([abs(t - p) for t, p in zip(mat_n_true, mat_n_pred)])
+        
+        print(f"{mat:<12} {len(mat_results):<7} {mat_accuracy:>6.1f}%    "
+              f"{mat_n_true[0]:.2f}     {np.mean(mat_n_pred):.4f}±{np.std(mat_n_pred):.4f}  "
+              f"{mat_mse:.6f}  {mat_mae:.6f}")
+    
+    # Confusion Matrix
+    print(f"\n=== Confusion Matrix ===")
+    from collections import defaultdict
+    confusion = defaultdict(lambda: defaultdict(int))
+    for r in results:
+        confusion[r['material_true']][r['material_pred']] += 1
+    
+    # Print header
+    print(f"{'True \\ Pred':<12}", end="")
+    for mat in materials:
+        print(f"{mat:<10}", end="")
+    print()
+    print("-" * (12 + 10 * len(materials)))
+    
+    # Print rows
+    for true_mat in materials:
+        print(f"{true_mat:<12}", end="")
+        for pred_mat in materials:
+            count = confusion[true_mat][pred_mat]
+            print(f"{count:<10}", end="")
+        print()
     
     # 결과 저장
     output_file = os.path.join(save_dir, 'inference_results.json')
@@ -158,20 +223,33 @@ def inference_single_sample(model, image_paths, device):
     images = images.permute(0, 3, 1, 2)  # (5, 3, H, W)
     images = images.unsqueeze(0)  # (1, 5, 3, H, W)
     
-    # 물리 계수 예측
-    coeffs = predict_coefficients(model, images, device)
+    # 재료 분류 및 물리 계수 예측
+    preds = predict_material(model, images, device)
     
     # 피처맵 추출
     features = extract_features(model, images, device)
     
-    print(f"Predicted coefficients:")
-    print(f"  Refractive index (n):            {coeffs['n'][0]:.4f}")
-    print(f"  Absorption coefficient (μa):     {coeffs['mu_a'][0]:.4f}")
-    print(f"  Reduced scattering coeff (μs'):  {coeffs['mu_s_prime'][0]:.4f}")
-    print(f"\nFeature map shape: {features.shape}")
+    # Material name
+    pred_material_idx = int(preds['class_pred'][0])
+    pred_material_name = OpticalScatteringDataset.IDX_TO_MATERIAL.get(pred_material_idx, 'unknown')
+    
+    print(f"\n📊 Classification:")
+    print(f"  Predicted Material: {pred_material_name} (class {pred_material_idx})")
+    print(f"  Class Probabilities:")
+    for idx, prob in enumerate(preds['class_probs'][0]):
+        mat_name = OpticalScatteringDataset.IDX_TO_MATERIAL.get(idx, 'unknown')
+        print(f"    {mat_name:<10}: {prob:.4f} ({prob*100:.1f}%)")
+    
+    print(f"\n📐 Physical Coefficients:")
+    print(f"  Refractive index (n):            {preds['n'][0]:.4f}")
+    print(f"  Absorption coefficient (μa):     {preds['mu_a'][0]:.4f}")
+    print(f"  Reduced scattering coeff (μs'):  {preds['mu_s_prime'][0]:.4f}")
+    
+    print(f"\n🗺️ Feature Map:")
+    print(f"  Shape: {features.shape}")
     print(f"  (Batch, Time, Channels, Height, Width)")
     
-    return coeffs, features
+    return preds, features
 
 
 def main():

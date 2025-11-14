@@ -24,10 +24,14 @@ model = dict(
     
     # Physics Loss Configuration
     physics=dict(
-        c=3e8,              # 광속 (m/s)
-        physics_weight=10.0, # Physics loss 가중치
-        data_weight=1.0,    # Data loss 가중치
-    )
+        c=3e8,                      # 광속 (m/s)
+        physics_weight=1.0,         # Physics loss 가중치 (PDE 제약)
+        data_weight=1.0,            # Data loss 가중치 (굴절률 예측)
+        classification_weight=10.0, # Classification loss 가중치 (주 목표)
+    ),
+    
+    # Classification Configuration
+    num_classes=5,  # 5개 재료: air, water, acrylic, glass, sapphire
 )
 
 # ========================

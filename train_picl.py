@@ -30,6 +30,17 @@ class OpticalScatteringDataset(Dataset):
     JSON 파일에서 레이블 정보를 로드합니다.
     """
     
+    # Material name to class index mapping
+    MATERIAL_TO_IDX = {
+        'air': 0,
+        'water': 1,
+        'acrylic': 2,
+        'glass': 3,
+        'sapphire': 4
+    }
+    
+    IDX_TO_MATERIAL = {v: k for k, v in MATERIAL_TO_IDX.items()}
+    
     def __init__(self, data_root, label_file, image_size=224, transform=None):
         self.data_root = Path(data_root)
         self.label_file = label_file
@@ -90,8 +101,13 @@ class OpticalScatteringDataset(Dataset):
         
         n_true = torch.tensor(sample['n_true'], dtype=torch.float32)
         
+        # Material class to index
+        material_class = sample['class']
+        material_idx = self.MATERIAL_TO_IDX.get(material_class, 0)
+        material_label = torch.tensor(material_idx, dtype=torch.long)
+        
         # 5개 시퀀스 => 1개 예측값
-        return images, n_true, sample['class']
+        return images, n_true, material_label
 
 
 def load_config(config_path):
@@ -146,18 +162,24 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
     total_loss = 0
     total_data_loss = 0
     total_physics_loss = 0
+    total_cls_loss = 0
+    correct = 0
+    total_samples = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    for images, n_true, class_names in pbar:
+    for images, n_true, material_label in pbar:
         images = images.to(device)
         n_true = n_true.to(device)
+        material_label = material_label.to(device)
         
         # Forward pass
-        results = model(images, n_true)
+        results = model(images, n_true, material_label)
         
         loss = results['total_loss']
         data_loss = results['data_loss']
         physics_loss = results['physics_loss']
+        cls_loss = results['classification_loss']
+        class_pred = results['class_pred']
         
         # Backward pass
         optimizer.zero_grad()
@@ -168,47 +190,69 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         total_loss += loss.item()
         total_data_loss += data_loss.item()
         total_physics_loss += physics_loss.item()
+        total_cls_loss += cls_loss.item()
+        
+        # Accuracy
+        correct += (class_pred == material_label).sum().item()
+        total_samples += material_label.size(0)
         
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
+            'cls': f"{cls_loss.item():.4f}",
             'data': f"{data_loss.item():.4f}",
-            'physics': f"{physics_loss.item():.4f}"
+            'physics': f"{physics_loss.item():.4f}",
+            'acc': f"{100.0 * correct / total_samples:.1f}%"
         })
     
     avg_loss = total_loss / len(dataloader)
     avg_data_loss = total_data_loss / len(dataloader)
     avg_physics_loss = total_physics_loss / len(dataloader)
+    avg_cls_loss = total_cls_loss / len(dataloader)
+    accuracy = 100.0 * correct / total_samples
     
-    return avg_loss, avg_data_loss, avg_physics_loss
+    return avg_loss, avg_data_loss, avg_physics_loss, avg_cls_loss, accuracy
 
 
 def validate(model, dataloader, device):
     """검증"""
     model.eval()
     total_loss = 0
+    total_cls_loss = 0
     predictions = []
     ground_truths = []
+    class_predictions = []
+    class_labels = []
     
     with torch.no_grad():
-        for images, n_true, class_names in tqdm(dataloader, desc="Validating"):
+        for images, n_true, material_label in tqdm(dataloader, desc="Validating"):
             images = images.to(device)
             n_true = n_true.to(device)
+            material_label = material_label.to(device)
             
             # Forward pass
-            results = model(images, n_true)
+            results = model(images, n_true, material_label)
             
             total_loss += results['total_loss'].item()
+            total_cls_loss += results['classification_loss'].item()
             predictions.extend(results['n_pred'].cpu().numpy())
             ground_truths.extend(n_true.cpu().numpy())
+            class_predictions.extend(results['class_pred'].cpu().numpy())
+            class_labels.extend(material_label.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
+    avg_cls_loss = total_cls_loss / len(dataloader)
     predictions = np.array(predictions)
     ground_truths = np.array(ground_truths)
+    class_predictions = np.array(class_predictions)
+    class_labels = np.array(class_labels)
     
     # MSE 계산
     mse = np.mean((predictions - ground_truths) ** 2)
     
-    return avg_loss, mse, predictions, ground_truths
+    # Accuracy 계산
+    accuracy = 100.0 * np.mean(class_predictions == class_labels)
+    
+    return avg_loss, avg_cls_loss, mse, accuracy, predictions, ground_truths, class_predictions, class_labels
 
 
 def main():
@@ -255,7 +299,8 @@ def main():
             'd_model': config['model']['temporal']['d_model'],
             'device': device
         },
-        physics_config=config['model']['physics']
+        physics_config=config['model']['physics'],
+        num_classes=config['model']['num_classes']
     )
     model = model.to(device)
     
@@ -280,14 +325,16 @@ def main():
     print("\n=== Training ===")
     for epoch in range(start_epoch, config['train']['epochs']):
         # Train
-        avg_loss, avg_data_loss, avg_physics_loss = train_epoch(
+        avg_loss, avg_data_loss, avg_physics_loss, avg_cls_loss, accuracy = train_epoch(
             model, train_loader, optimizer, device, epoch
         )
         
         print(f"\nEpoch {epoch}:")
         print(f"  Train Loss: {avg_loss:.4f}")
+        print(f"  Classification Loss: {avg_cls_loss:.4f}")
         print(f"  Data Loss: {avg_data_loss:.4f}")
         print(f"  Physics Loss: {avg_physics_loss:.4f}")
+        print(f"  Accuracy: {accuracy:.2f}%")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Scheduler step
