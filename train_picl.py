@@ -179,7 +179,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         data_loss = results['data_loss']
         physics_loss = results['physics_loss']
         cls_loss = results['classification_loss']
-        class_pred = results['class_pred']
+        class_pred = results['direct_class_pred']  # ETF Classifier의 직접 분류 결과
         
         # Backward pass
         optimizer.zero_grad()
@@ -236,7 +236,7 @@ def validate(model, dataloader, device):
             total_cls_loss += results['classification_loss'].item()
             predictions.extend(results['n_pred'].cpu().numpy())
             ground_truths.extend(n_true.cpu().numpy())
-            class_predictions.extend(results['class_pred'].cpu().numpy())
+            class_predictions.extend(results['direct_class_pred'].cpu().numpy())  # ETF Classifier의 직접 분류 결과
             class_labels.extend(material_label.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)

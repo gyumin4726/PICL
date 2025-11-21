@@ -15,9 +15,7 @@ GPUS=1
 echo "========================================="
 echo "PICL Training"
 echo "========================================="
-python train_picl.py ${CONFIG} \
-    --work-dir ${WORK_DIR} \
-    --device cuda
+python train_picl.py ${CONFIG} --work-dir ${WORK_DIR} --device cuda
 
 # ===========================
 # 추론 (Inference) - 데이터셋 전체
@@ -26,29 +24,7 @@ echo ""
 echo "========================================="
 echo "PICL Inference on Test Dataset"
 echo "========================================="
-python inference_picl.py ${CONFIG} \
-    ${WORK_DIR}/best.pth \
-    --mode dataset \
-    --output-dir ${WORK_DIR}/inference_results \
-    --device cuda
-
-# ===========================
-# 추론 (Inference) - 단일 샘플 예시
-# ===========================
-# echo ""
-# echo "========================================="
-# echo "PICL Inference on Single Sample"
-# echo "========================================="
-# python inference_picl.py ${CONFIG} \
-#     ${WORK_DIR}/best.pth \
-#     --mode single \
-#     --images test/water_4D_test/images/img_0.png \
-#             test/water_4D_test/images/img_1.png \
-#             test/water_4D_test/images/img_2.png \
-#             test/water_4D_test/images/img_3.png \
-#             test/water_4D_test/images/img_4.png \
-#     --output-dir ${WORK_DIR}/single_inference \
-#     --device cuda
+python inference_picl.py ${CONFIG} ${WORK_DIR}/best.pth --mode dataset --output-dir ${WORK_DIR}/inference_results --device cuda
 
 echo ""
 echo "✓ PICL pipeline completed!"

@@ -228,26 +228,26 @@ class ETFClassifier(nn.Module):
         
         return etf_weights
     
-    def forward(self, physical_coeffs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for material classification using ETF geometry.
         
         Process:
-        1. Extract features: (B, 3) → (B, 32) using learnable MLP
+        1. Extract features: (B, input_dim) → (B, feature_dim) using learnable MLP
         2. L2 normalize: Required for ETF geometry (projects onto hypersphere)
         3. Compute logits: features @ W_ETF^T (bias-free linear)
         4. Predict class: argmax over logits
         
         Args:
-            physical_coeffs (torch.Tensor): Physical coefficients (B, 3) - [n, μₐ, μₛ']
+            input_features (torch.Tensor): Input features (B, input_dim) - Can be temporal features or physical coefficients
             
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
                 - class_logits: (B, num_classes) - Class logits (not probabilities)
                 - class_pred: (B,) - Predicted class indices [0-4]
         """
-        # 1. Extract features from physical coefficients (3 → 32 dimensions)
-        features = self.feature_extractor(physical_coeffs)  # (B, feature_dim)
+        # 1. Extract features from input (input_dim → feature_dim dimensions)
+        features = self.feature_extractor(input_features)  # (B, feature_dim)
         
         # 2. L2 normalize features (CRITICAL for ETF geometry)
         # Projects features onto unit hypersphere
@@ -352,11 +352,12 @@ class PICLModel(nn.Module):
             dropout=0.5
         )
         
-        # 4. ETF Classifier (Material Classification from Physical Coefficients)
-        self.classifier = ETFClassifier(
+        # 4. ETF Classifier (Material Classification directly from temporal features)
+        # 1D Mamba 출력을 ETF Classifier로 직접 분류
+        self.direct_classifier = ETFClassifier(
             num_classes=num_classes,  # 5 materials
-            input_dim=3,  # n, μa, μs'
-            hidden_dims=(64, 32)
+            input_dim=temporal_config['d_model'],  # 512 (1D Mamba 출력 차원)
+            hidden_dims=(256, 128)  # Feature extractor dimensions
         )
         
         # 5. Physics Loss Module
@@ -400,22 +401,41 @@ class PICLModel(nn.Module):
         if isinstance(features, (tuple, list)):
             features = features[0]  # Sometimes nested, get again
         
-        # Global average pooling
-        features = F.adaptive_avg_pool2d(features, (1, 1))  # (B*T, 1024, 1, 1)
-        features = features.flatten(1)  # (B*T, 1024)
+        # Preserve spatial structure: Use adaptive pooling to reduce but not eliminate spatial info
+        # Instead of (1,1), use (7,7) to keep some spatial structure
+        # This allows us to model temporal relationships per spatial location
+        _, C_feat, H_feat, W_feat = features.shape
         
-        # Reshape back to batch format
-        features = features.view(B, T, -1)  # (B, T, 1024)
+        # Adaptive pooling to reduce spatial size but preserve structure
+        # (B*T, 1024, H', W') -> (B*T, 1024, 7, 7) for manageable size
+        target_size = min(7, H_feat, W_feat)  # Use smaller of 7 or actual size
+        features = F.adaptive_avg_pool2d(features, (target_size, target_size))  # (B*T, 1024, 7, 7)
         
-        # 2. 1D Mamba + SequenceToValue: Process temporal sequence
-        temporal_features = self.temporal(features)  # (B, 512)
+        # Reshape to (B, T, C, H, W) for temporal processing per spatial location
+        features = features.view(B, T, C_feat, target_size, target_size)  # (B, T, 1024, 7, 7)
         
-        # 3. MLP Regressor: Predict physical coefficients
+        # Process temporal sequence for each spatial location
+        # Reshape: (B, T, C, H, W) -> (B*H*W, T, C) to process each spatial location independently
+        B, T, C, H_sp, W_sp = features.shape
+        features_reshaped = features.permute(0, 3, 4, 1, 2).contiguous()  # (B, H_sp, W_sp, T, C)
+        features_reshaped = features_reshaped.view(B * H_sp * W_sp, T, C)  # (B*H_sp*W_sp, T, C)
+        
+        # 2. 1D Mamba: Process temporal sequence for each spatial location
+        temporal_features = self.temporal(features_reshaped)  # (B*H_sp*W_sp, 512)
+        
+        # Reshape back and aggregate spatial information
+        temporal_features = temporal_features.view(B, H_sp, W_sp, -1)  # (B, H_sp, W_sp, 512)
+        # Aggregate spatial information: average pooling
+        temporal_features = temporal_features.permute(0, 3, 1, 2)  # (B, 512, H_sp, W_sp)
+        temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))  # (B, 512, 1, 1)
+        temporal_features = temporal_features.flatten(1)  # (B, 512)
+        
+        # 3. 병렬 경로: 물리계수 예측 + 직접 분류
+        # 경로 1: MLP Regressor → 3개 계수 예측
         n_pred, mu_a_pred, mu_s_prime_pred = self.regressor(temporal_features)
         
-        # 4. ETF Classifier: Material classification from physical coefficients
-        physical_coeffs = torch.stack([n_pred, mu_a_pred, mu_s_prime_pred], dim=1)  # (B, 3)
-        class_logits, class_pred = self.classifier(physical_coeffs)  # (B, num_classes), (B,)
+        # 경로 2: ETF Classifier로 직접 분류 (1D Mamba 출력에서 바로 분류)
+        direct_class_logits, direct_class_pred = self.direct_classifier(temporal_features)  # (B, num_classes), (B,)
         
         # ========================================
         # PATH 2: Physics Quantities Computation
@@ -441,17 +461,18 @@ class PICLModel(nn.Module):
             dx=1.0, dy=1.0, dt=1.0         # Spatial and temporal steps
         )
         
-        # 3.2. Classification Loss
-        classification_loss = torch.tensor(0.0, device=images.device)
+        # 3.2. Classification Loss (직접 분류 경로만)
+        direct_classification_loss = torch.tensor(0.0, device=images.device)
         if material_label is not None:
-            classification_loss = F.cross_entropy(class_logits, material_label)
+            # 직접 분류하는 loss
+            direct_classification_loss = F.cross_entropy(direct_class_logits, material_label)
         
         # 3.3. Total Loss
         w_cls = self.physics_config.get('classification_weight', 10.0)
         w_data = self.physics_config.get('data_weight', 1.0)
         w_physics = self.physics_config.get('physics_weight', 1.0)
         
-        total_loss = (w_cls * classification_loss + 
+        total_loss = (w_cls * direct_classification_loss + 
                      w_data * loss_dict['data_loss'] + 
                      w_physics * loss_dict['physics_loss'])
         
@@ -465,17 +486,16 @@ class PICLModel(nn.Module):
             'mu_a_pred': mu_a_pred,
             'mu_s_prime_pred': mu_s_prime_pred,
             
-            # Predictions - Classification
-            'class_logits': class_logits,
-            'class_pred': class_pred,
+            # Predictions - Direct Classification (직접 분류)
+            'direct_class_logits': direct_class_logits,
+            'direct_class_pred': direct_class_pred,
             
             # Features
             'temporal_features': temporal_features,
-            'physical_coeffs': physical_coeffs,
             
             # Losses
             'total_loss': total_loss,
-            'classification_loss': classification_loss,
+            'classification_loss': direct_classification_loss,  # 직접 분류 loss
             'data_loss': loss_dict['data_loss'],
             'physics_loss': loss_dict['physics_loss'],
             
@@ -507,13 +527,29 @@ class PICLModel(nn.Module):
             if isinstance(features, (tuple, list)):
                 features = features[0]
             
-            # Global pooling
-            features = F.adaptive_avg_pool2d(features, (1, 1))
-            features = features.flatten(1)
-            features = features.view(B, T, -1)
+            # Preserve spatial structure: Use adaptive pooling to reduce but not eliminate spatial info
+            _, C_feat, H_feat, W_feat = features.shape
             
-            # 2. 1D Mamba + SequenceToValue
-            temporal_features = self.temporal(features)
+            # Adaptive pooling to reduce spatial size but preserve structure
+            target_size = min(7, H_feat, W_feat)  # Use smaller of 7 or actual size
+            features = F.adaptive_avg_pool2d(features, (target_size, target_size))  # (B*T, 1024, 7, 7)
+            
+            # Reshape to (B, T, C, H, W) for temporal processing per spatial location
+            features = features.view(B, T, C_feat, target_size, target_size)  # (B, T, 1024, 7, 7)
+            
+            # Process temporal sequence for each spatial location
+            B, T, C, H_sp, W_sp = features.shape
+            features_reshaped = features.permute(0, 3, 4, 1, 2).contiguous()  # (B, H_sp, W_sp, T, C)
+            features_reshaped = features_reshaped.view(B * H_sp * W_sp, T, C)  # (B*H_sp*W_sp, T, C)
+            
+            # 2. 1D Mamba: Process temporal sequence for each spatial location
+            temporal_features = self.temporal(features_reshaped)  # (B*H_sp*W_sp, 512)
+            
+            # Reshape back and aggregate spatial information
+            temporal_features = temporal_features.view(B, H_sp, W_sp, -1)  # (B, H_sp, W_sp, 512)
+            temporal_features = temporal_features.permute(0, 3, 1, 2)  # (B, 512, H_sp, W_sp)
+            temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))  # (B, 512, 1, 1)
+            temporal_features = temporal_features.flatten(1)  # (B, 512)
             
             # 3. MLP Regressor
             n_pred, mu_a_pred, mu_s_prime_pred = self.regressor(temporal_features)
@@ -529,19 +565,45 @@ class PICLModel(nn.Module):
             
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
-                - class_logits: (B, num_classes) - Class probabilities
+                - class_logits: (B, num_classes) - Class logits (직접 분류)
                 - class_pred: (B,) - Predicted class indices
                 - physical_coeffs: (B, 3) - [n, μₐ, μₛ']
         """
         with torch.no_grad():
-            # Get physical coefficients
-            n_pred, mu_a_pred, mu_s_prime_pred = self.predict_coefficients(images)
+            B, T, C, H, W = images.shape
             
-            # Stack coefficients
+            # 1. 2D VMamba
+            x_flat = images.view(B * T, C, H, W)
+            features = self.backbone(x_flat)
+            if isinstance(features, (tuple, list)):
+                features = features[0]
+            if isinstance(features, (tuple, list)):
+                features = features[0]
+            
+            # Preserve spatial structure
+            _, C_feat, H_feat, W_feat = features.shape
+            target_size = min(7, H_feat, W_feat)
+            features = F.adaptive_avg_pool2d(features, (target_size, target_size))
+            
+            # Reshape for temporal processing
+            features = features.view(B, T, C_feat, target_size, target_size)
+            B, T, C, H_sp, W_sp = features.shape
+            features_reshaped = features.permute(0, 3, 4, 1, 2).contiguous()
+            features_reshaped = features_reshaped.view(B * H_sp * W_sp, T, C)
+            
+            # 2. 1D Mamba
+            temporal_features = self.temporal(features_reshaped)
+            temporal_features = temporal_features.view(B, H_sp, W_sp, -1)
+            temporal_features = temporal_features.permute(0, 3, 1, 2)
+            temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))
+            temporal_features = temporal_features.flatten(1)  # (B, 512)
+            
+            # 3. Get physical coefficients
+            n_pred, mu_a_pred, mu_s_prime_pred = self.regressor(temporal_features)
             physical_coeffs = torch.stack([n_pred, mu_a_pred, mu_s_prime_pred], dim=1)  # (B, 3)
             
-            # Classify material
-            class_logits, class_pred = self.classifier(physical_coeffs)
+            # 4. ETF Classifier로 직접 분류
+            class_logits, class_pred = self.direct_classifier(temporal_features)  # (B, num_classes), (B,)
             
             return class_logits, class_pred, physical_coeffs
 
