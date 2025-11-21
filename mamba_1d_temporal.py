@@ -316,22 +316,17 @@ class Mamba1D(nn.Module):
 
 class SequenceToValue(nn.Module):
     """
-    Sequence-to-Value: 1D Mamba + Last Step Selection
+    Sequence-to-Value: 1D Mamba + All Steps Utilization
     
-    Input: (B, 5, 1024) - Mamba의 직접적인 출력 [h_t1, h_t2, h_t3, h_t4, h_t5]
-    Output: (B, 1024) - 마지막 시점의 은닉 상태 벡터 h_5만 선택
-    
-    텐서 형태: (5, 1024) -> (1024)
+    Input: (B, 5, 1024) - VMamba feature vectors [h_t1, h_t2, h_t3, h_t4, h_t5]
+    Output: (B, 5, 1024) - All time steps hidden state vectors
     """
-    def __init__(self, input_dim=1024, d_model=512, device=None):
+    def __init__(self, input_dim=1024, device=None):
         super().__init__()
-        
-        # Input projection to d_model
-        self.input_proj = nn.Linear(input_dim, d_model)
         
         # 1D Mamba for sequence processing (Official implementation)
         self.mamba1d = Mamba1D(
-            d_model=d_model,
+            d_model=input_dim,
             d_state=16,
             d_conv=4,
             expand=2,
@@ -341,28 +336,20 @@ class SequenceToValue(nn.Module):
         
     def forward(self, x):
         """
-        Forward pass: Sequence-to-Value
+        Forward pass: Return all time steps.
         
         Args:
-            x: (B, 5, 1024) - Mamba의 직접적인 출력 [h_t1, h_t2, h_t3, h_t4, h_t5]
+            x: (B, 5, 1024) - VMamba feature vectors [h_t1, h_t2, h_t3, h_t4, h_t5]
             
         Returns:
-            h_5: (B, d_model) - 마지막 시점의 은닉 상태 벡터 (전체 시퀀스 정보 포함)
+            processed: (B, 5, 1024) - All time steps hidden state vectors
         """
         B, T, D = x.shape
         
-        # Input projection
-        x = self.input_proj(x)  # (B, 5, d_model)
-        
         # 1D Mamba sequence processing
-        # 각 시간 스텝에서 현재 입력 + 누적된 이전 정보 처리
-        processed = self.mamba1d(x)  # (B, 5, d_model)
+        processed = self.mamba1d(x)  # (B, 5, 1024)
         
-        # 마지막 시점의 은닉 상태 벡터만 선택
-        # h_5는 t1 + t2 + t3 + t4 + t5의 모든 정보를 포함
-        h_5 = processed[:, -1, :]  # (B, d_model)
-        
-        return h_5
+        return processed  # (B, 5, 1024)
 
 
 if __name__ == "__main__":
@@ -384,7 +371,7 @@ if __name__ == "__main__":
     
     # Test SequenceToValue (Sequence-to-Value)
     print("\n📋 Testing SequenceToValue (Sequence-to-Value)...")
-    seq2val = SequenceToValue(input_dim=1024, d_model=512, device=device)
+    seq2val = SequenceToValue(input_dim=1024, device=device)
     seq2val = seq2val.to(device)  # Move model to device
     test_sequence = torch.randn(2, 5, 1024, device=device)  # (B, 5, 1024)
     final_value = seq2val(test_sequence)

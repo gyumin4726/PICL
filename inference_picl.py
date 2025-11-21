@@ -25,7 +25,6 @@ def load_model(config, checkpoint_path, device):
         pretrained_path=None,  # Checkpoint에서 로드할 것이므로 None
         temporal_config={
             'input_dim': config['model']['temporal']['input_dim'],
-            'd_model': config['model']['temporal']['d_model'],
             'device': device
         },
         physics_config=config['model']['physics'],

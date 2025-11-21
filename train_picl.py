@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam, SGD, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR, ReduceLROnPlateau
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
@@ -146,6 +146,15 @@ def build_scheduler(optimizer, config):
     
     if sched_type == 'CosineAnnealing':
         scheduler = CosineAnnealingLR(optimizer, T_max=params['T_max'], eta_min=params['eta_min'])
+    elif sched_type == 'ReduceLROnPlateau':
+        scheduler = ReduceLROnPlateau(
+            optimizer, 
+            mode='min',  # loss가 감소하는 방향
+            factor=params.get('factor', 0.5),  # 학습률을 0.5배로 감소
+            patience=params.get('patience', 5),  # 5 epoch 동안 개선 없으면 감소
+            verbose=True,  # 학습률 변경 시 출력
+            min_lr=params.get('min_lr', 1e-6)  # 최소 학습률
+        )
     elif sched_type == 'StepLR':
         scheduler = StepLR(optimizer, step_size=params['step_size'], gamma=params['gamma'])
     elif sched_type == 'MultiStepLR':
@@ -296,7 +305,6 @@ def main():
         pretrained_path=config['model']['backbone']['pretrained_path'],
         temporal_config={
             'input_dim': config['model']['temporal']['input_dim'],
-            'd_model': config['model']['temporal']['d_model'],
             'device': device
         },
         physics_config=config['model']['physics'],
@@ -338,7 +346,11 @@ def main():
         print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Scheduler step
-        scheduler.step()
+        # ReduceLROnPlateau는 train loss를 인자로 받음 (validation이 없으므로)
+        if isinstance(scheduler, ReduceLROnPlateau):
+            scheduler.step(avg_loss)  # train loss 기반
+        else:
+            scheduler.step()  # epoch 기반
         
         # 체크포인트 저장
         if (epoch + 1) % config['train']['save_interval'] == 0:

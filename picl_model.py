@@ -316,8 +316,7 @@ class PICLModel(nn.Module):
         # Default configurations
         if temporal_config is None:
             temporal_config = {
-                'input_dim': 1024,
-                'd_model': 512,
+                'input_dim': 1024,  # VMamba 출력 차원 (정보 손실 방지)
                 'device': 'cuda' if torch.cuda.is_available() else 'cpu'
             }
         
@@ -341,22 +340,23 @@ class PICLModel(nn.Module):
         # 2. 1D Mamba + SequenceToValue (Temporal Sequence Modeler)
         self.temporal = SequenceToValue(
             input_dim=temporal_config['input_dim'],
-            d_model=temporal_config['d_model'],
             device=temporal_config['device']
         )
         
+        # Temporal feature dimension: average pooling으로 1024 차원 유지
+        temporal_feature_dim = temporal_config['input_dim']  # 1024
+        
         # 3. MLP Regressor (Physical Coefficients Predictor)
         self.regressor = MLPRegressor(
-            input_dim=temporal_config['d_model'],
+            input_dim=temporal_feature_dim,  # 1024
             hidden_dim=256,
             dropout=0.5
         )
         
         # 4. ETF Classifier (Material Classification directly from temporal features)
-        # 1D Mamba 출력을 ETF Classifier로 직접 분류
         self.direct_classifier = ETFClassifier(
             num_classes=num_classes,  # 5 materials
-            input_dim=temporal_config['d_model'],  # 512 (1D Mamba 출력 차원)
+            input_dim=temporal_feature_dim,  # 1024
             hidden_dims=(256, 128)  # Feature extractor dimensions
         )
         
@@ -421,14 +421,17 @@ class PICLModel(nn.Module):
         features_reshaped = features_reshaped.view(B * H_sp * W_sp, T, C)  # (B*H_sp*W_sp, T, C)
         
         # 2. 1D Mamba: Process temporal sequence for each spatial location
-        temporal_features = self.temporal(features_reshaped)  # (B*H_sp*W_sp, 512)
+        temporal_features_all = self.temporal(features_reshaped)  # (B*H_sp*W_sp, 5, 1024)
+        
+        # Average pooling over time steps: (B*H_sp*W_sp, 5, 1024) → (B*H_sp*W_sp, 1024)
+        temporal_features = temporal_features_all.mean(dim=1)  # (B*H_sp*W_sp, 1024)
         
         # Reshape back and aggregate spatial information
-        temporal_features = temporal_features.view(B, H_sp, W_sp, -1)  # (B, H_sp, W_sp, 512)
+        temporal_features = temporal_features.view(B, H_sp, W_sp, -1)  # (B, H_sp, W_sp, 1024)
         # Aggregate spatial information: average pooling
-        temporal_features = temporal_features.permute(0, 3, 1, 2)  # (B, 512, H_sp, W_sp)
-        temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))  # (B, 512, 1, 1)
-        temporal_features = temporal_features.flatten(1)  # (B, 512)
+        temporal_features = temporal_features.permute(0, 3, 1, 2)  # (B, 1024, H_sp, W_sp)
+        temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))  # (B, 1024, 1, 1)
+        temporal_features = temporal_features.flatten(1)  # (B, 1024)
         
         # 3. 병렬 경로: 물리계수 예측 + 직접 분류
         # 경로 1: MLP Regressor → 3개 계수 예측
@@ -591,12 +594,18 @@ class PICLModel(nn.Module):
             features_reshaped = features.permute(0, 3, 4, 1, 2).contiguous()
             features_reshaped = features_reshaped.view(B * H_sp * W_sp, T, C)
             
-            # 2. 1D Mamba
-            temporal_features = self.temporal(features_reshaped)
-            temporal_features = temporal_features.view(B, H_sp, W_sp, -1)
-            temporal_features = temporal_features.permute(0, 3, 1, 2)
-            temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))
-            temporal_features = temporal_features.flatten(1)  # (B, 512)
+            # 2. 1D Mamba: Process temporal sequence for each spatial location
+            temporal_features_all = self.temporal(features_reshaped)  # (B*H_sp*W_sp, 5, 1024)
+            
+            # Average pooling over time steps: (B*H_sp*W_sp, 5, 1024) → (B*H_sp*W_sp, 1024)
+            temporal_features = temporal_features_all.mean(dim=1)  # (B*H_sp*W_sp, 1024)
+            
+            # Reshape back and aggregate spatial information
+            temporal_features = temporal_features.view(B, H_sp, W_sp, -1)  # (B, H_sp, W_sp, 1024)
+            # Aggregate spatial information: average pooling
+            temporal_features = temporal_features.permute(0, 3, 1, 2)  # (B, 1024, H_sp, W_sp)
+            temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))  # (B, 1024, 1, 1)
+            temporal_features = temporal_features.flatten(1)  # (B, 1024)
             
             # 3. Get physical coefficients
             n_pred, mu_a_pred, mu_s_prime_pred = self.regressor(temporal_features)

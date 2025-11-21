@@ -18,8 +18,7 @@ model = dict(
     
     # 1D Mamba Temporal (시간적 시퀀스 모델링)
     temporal=dict(
-        input_dim=1024,  # VMamba backbone output dim
-        d_model=512,     # Temporal feature dimension
+        input_dim=1024,  # VMamba backbone output dim (정보 손실 방지를 위해 1024 유지)
     ),
     
     # Physics Loss Configuration
@@ -64,17 +63,18 @@ data = dict(
 # ========================
 train = dict(
     epochs=10,
-    learning_rate=0.001,
+    learning_rate=0.0005,
     weight_decay=0.0001,
     
     # Optimizer
     optimizer='Adam',  # 'Adam', 'SGD', 'AdamW'
     
     # Learning rate scheduler
-    scheduler='CosineAnnealing',  # 'CosineAnnealing', 'StepLR', 'MultiStepLR'
+    scheduler='ReduceLROnPlateau',  # 'CosineAnnealing', 'ReduceLROnPlateau', 'StepLR', 'MultiStepLR'
     scheduler_params=dict(
-        T_max=100,
-        eta_min=1e-6
+        factor=0.5,      # 학습률을 0.5배로 감소
+        patience=2,      # 5 epoch 동안 개선 없으면 감소
+        min_lr=1e-6      # 최소 학습률
     ),
     
     # Checkpoint
