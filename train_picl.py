@@ -8,6 +8,7 @@ import os
 import sys
 import argparse
 import json
+import random
 from pathlib import Path
 
 import torch
@@ -175,7 +176,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
     correct = 0
     total_samples = 0
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
     for images, n_true, material_label in pbar:
         images = images.to(device)
         n_true = n_true.to(device)
@@ -275,6 +276,22 @@ def main():
     # Config 로드
     config = load_config(args.config)
     
+    # Random seed 설정 (재현성을 위해)
+    seed = config.get('seed', 42)
+    deterministic = config.get('deterministic', True)
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    print(f"Random seed: {seed}, Deterministic: {deterministic}")
+    
     # Work directory 설정
     work_dir = args.work_dir if args.work_dir else config['work_dir']
     os.makedirs(work_dir, exist_ok=True)
@@ -298,6 +315,23 @@ def main():
         num_workers=config['data']['train']['num_workers']
     )
     
+    # Test 데이터셋을 validation으로 사용 (별도 validation dataset 없음)
+    test_dataset = OpticalScatteringDataset(
+        data_root=config['data']['test']['data_root'],
+        label_file=config['data']['test']['label_file'],
+        image_size=config['data']['test']['image_size']
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['data']['test']['batch_size'],
+        shuffle=False,  # Validation/Test는 shuffle 안 함
+        num_workers=config['data']['test']['num_workers']
+    )
+    
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Test samples (used for validation): {len(test_dataset)}")
+    
     # 모델 생성
     print("\n=== Building Model ===")
     model = PICLModel(
@@ -320,65 +354,85 @@ def main():
     
     # Resume
     start_epoch = 0
+    best_accuracy = 0.0  # Accuracy 기준으로 best model 저장
     best_loss = float('inf')
     if args.resume:
         checkpoint = torch.load(args.resume)
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         start_epoch = checkpoint['epoch']
-        best_loss = checkpoint['best_loss']
+        best_accuracy = checkpoint.get('best_accuracy', 0.0)
+        best_loss = checkpoint.get('best_loss', float('inf'))
         print(f"Resumed from epoch {start_epoch}")
+        print(f"Best accuracy so far: {best_accuracy:.2f}%")
     
     # 학습
-    print("\n=== Training ===")
+    print("\n" + "="*70)
+    print("=== Training ===")
+    print("="*70)
     for epoch in range(start_epoch, config['train']['epochs']):
-        # Train
-        avg_loss, avg_data_loss, avg_physics_loss, avg_cls_loss, accuracy = train_epoch(
+        # 1. Train
+        avg_loss, avg_data_loss, avg_physics_loss, avg_cls_loss, train_accuracy = train_epoch(
             model, train_loader, optimizer, device, epoch
         )
         
-        print(f"\nEpoch {epoch}:")
-        print(f"  Train Loss: {avg_loss:.4f}")
-        print(f"  Classification Loss: {avg_cls_loss:.4f}")
-        print(f"  Data Loss: {avg_data_loss:.4f}")
-        print(f"  Physics Loss: {avg_physics_loss:.4f}")
-        print(f"  Accuracy: {accuracy:.2f}%")
-        print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+        # 2. Evaluate (test 데이터로 평가)
+        eval_loss, eval_cls_loss, eval_mse, eval_accuracy, _, _, _, _ = validate(
+            model, test_loader, device
+        )
+        
+        # 출력
+        print("\n" + "-"*70)
+        print(f"Epoch {epoch + 1}/{config['train']['epochs']}")
+        print("-"*70)
+        print(f"  [Train]")
+        print(f"    Loss:      {avg_loss:.4f}")
+        print(f"    Cls Loss:  {avg_cls_loss:.4f}")
+        print(f"    Data Loss: {avg_data_loss:.4f}")
+        print(f"    Phys Loss: {avg_physics_loss:.4f}")
+        print(f"    Accuracy:  {train_accuracy:.2f}%")
+        print(f"  [Test/Validation]")
+        print(f"    Loss:      {eval_loss:.4f}")
+        print(f"    Cls Loss:  {eval_cls_loss:.4f}")
+        print(f"    MSE:       {eval_mse:.6f}")
+        print(f"    Accuracy:  {eval_accuracy:.2f}%")
+        print(f"  [Learning Rate]")
+        print(f"    LR:        {optimizer.param_groups[0]['lr']:.6f}")
         
         # Scheduler step
-        # ReduceLROnPlateau는 train loss를 인자로 받음 (validation이 없으므로)
+        # ReduceLROnPlateau는 eval loss를 인자로 받음
         if isinstance(scheduler, ReduceLROnPlateau):
-            scheduler.step(avg_loss)  # train loss 기반
+            scheduler.step(eval_loss)  # eval loss 기반
         else:
             scheduler.step()  # epoch 기반
         
-        # 체크포인트 저장
-        if (epoch + 1) % config['train']['save_interval'] == 0:
+        # 3. Best model 저장 (Accuracy 기준, 갱신될 때만)
+        is_best = eval_accuracy > best_accuracy
+        if is_best:
+            best_accuracy = eval_accuracy
+            best_loss = eval_loss
             checkpoint = {
                 'epoch': epoch + 1,
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
-                'best_loss': best_loss
-            }
-            torch.save(checkpoint, os.path.join(work_dir, f'epoch_{epoch+1}.pth'))
-        
-        # Best model 저장
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            checkpoint = {
-                'epoch': epoch + 1,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'best_loss': best_loss
+                'best_accuracy': best_accuracy,
+                'best_loss': best_loss,
+                'eval_accuracy': eval_accuracy,
+                'eval_loss': eval_loss
             }
             torch.save(checkpoint, os.path.join(work_dir, 'best.pth'))
-            print(f"  ✓ Best model saved!")
+            print(f"  [Best Model]")
+            print(f"    ✓ Saved! (Accuracy: {best_accuracy:.2f}%)")
+        else:
+            print(f"  [Best Model]")
+            print(f"    Best: {best_accuracy:.2f}% | Current: {eval_accuracy:.2f}%")
+        print("-"*70)
     
     print("\n=== Training Complete ===")
-    print(f"Best loss: {best_loss:.4f}")
-    print(f"Models saved in: {work_dir}")
+    print(f"Best Accuracy: {best_accuracy:.2f}%")
+    print(f"Best Loss: {best_loss:.4f}")
+    print(f"Best model saved in: {os.path.join(work_dir, 'best.pth')}")
 
 
 if __name__ == '__main__':
