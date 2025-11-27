@@ -176,6 +176,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
     correct = 0
     total_samples = 0
     
+    # 가중치 가져오기
+    w_cls = model.physics_config.get('classification_weight', 10.0)
+    w_data = model.physics_config.get('data_weight', 1.0)
+    w_physics = model.physics_config.get('physics_weight', 1.0)
+    
     pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
     for images, n_true, material_label in pbar:
         images = images.to(device)
@@ -206,11 +211,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         correct += (class_pred == material_label).sum().item()
         total_samples += material_label.size(0)
         
+        # 가중치가 곱해진 loss 값 표시
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
-            'cls': f"{cls_loss.item():.4f}",
-            'data': f"{data_loss.item():.4f}",
-            'physics': f"{physics_loss.item():.4f}",
+            'cls': f"{w_cls * cls_loss.item():.4f}",
+            'data': f"{w_data * data_loss.item():.4f}",
+            'physics': f"{w_physics * physics_loss.item():.4f}",
             'acc': f"{100.0 * correct / total_samples:.1f}%"
         })
     
@@ -366,6 +372,11 @@ def main():
         print(f"Resumed from epoch {start_epoch}")
         print(f"Best accuracy so far: {best_accuracy:.2f}%")
     
+    # 가중치 가져오기
+    w_cls = config['model']['physics'].get('classification_weight', 10.0)
+    w_data = config['model']['physics'].get('data_weight', 1.0)
+    w_physics = config['model']['physics'].get('physics_weight', 1.0)
+    
     # 학습
     print("\n" + "="*70)
     print("=== Training ===")
@@ -387,9 +398,9 @@ def main():
         print("-"*70)
         print(f"  [Train]")
         print(f"    Loss:      {avg_loss:.4f}")
-        print(f"    Cls Loss:  {avg_cls_loss:.4f}")
-        print(f"    Data Loss: {avg_data_loss:.4f}")
-        print(f"    Phys Loss: {avg_physics_loss:.4f}")
+        print(f"    Cls Loss:  {w_cls * avg_cls_loss:.4f} (weighted)")
+        print(f"    Data Loss: {w_data * avg_data_loss:.4f} (weighted)")
+        print(f"    Phys Loss: {w_physics * avg_physics_loss:.4f} (weighted)")
         print(f"    Accuracy:  {train_accuracy:.2f}%")
         print(f"  [Test/Validation]")
         print(f"    Loss:      {eval_loss:.4f}")
@@ -406,7 +417,23 @@ def main():
         else:
             scheduler.step()  # epoch 기반
         
-        # 3. Best model 저장 (Accuracy 기준, 갱신될 때만)
+        # 3. Checkpoint 저장
+        # 3.1. Latest model 저장 (매 epoch마다)
+        latest_checkpoint = {
+            'epoch': epoch + 1,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_accuracy': best_accuracy,
+            'best_loss': best_loss,
+            'eval_accuracy': eval_accuracy,
+            'eval_loss': eval_loss,
+            'train_accuracy': train_accuracy,
+            'train_loss': avg_loss
+        }
+        torch.save(latest_checkpoint, os.path.join(work_dir, 'latest.pth'))
+        
+        # 3.2. Best model 저장 (Accuracy 기준, 갱신될 때만)
         is_best = eval_accuracy > best_accuracy
         if is_best:
             best_accuracy = eval_accuracy
@@ -419,7 +446,9 @@ def main():
                 'best_accuracy': best_accuracy,
                 'best_loss': best_loss,
                 'eval_accuracy': eval_accuracy,
-                'eval_loss': eval_loss
+                'eval_loss': eval_loss,
+                'train_accuracy': train_accuracy,
+                'train_loss': avg_loss
             }
             torch.save(checkpoint, os.path.join(work_dir, 'best.pth'))
             print(f"  [Best Model]")
@@ -427,12 +456,23 @@ def main():
         else:
             print(f"  [Best Model]")
             print(f"    Best: {best_accuracy:.2f}% | Current: {eval_accuracy:.2f}%")
+        
+        # 3.3. Last model 저장 (마지막 epoch)
+        if epoch + 1 == config['train']['epochs']:
+            torch.save(latest_checkpoint, os.path.join(work_dir, 'last.pth'))
+            print(f"  [Last Model]")
+            print(f"    ✓ Saved! (Final epoch: {epoch + 1})")
+        
         print("-"*70)
     
     print("\n=== Training Complete ===")
     print(f"Best Accuracy: {best_accuracy:.2f}%")
     print(f"Best Loss: {best_loss:.4f}")
-    print(f"Best model saved in: {os.path.join(work_dir, 'best.pth')}")
+    print(f"\nSaved checkpoints:")
+    print(f"  - best.pth:  Best model (Accuracy: {best_accuracy:.2f}%)")
+    print(f"  - latest.pth: Latest model (Epoch {config['train']['epochs']})")
+    print(f"  - last.pth:  Final model (Epoch {config['train']['epochs']})")
+    print(f"\nAll saved in: {work_dir}")
 
 
 if __name__ == '__main__':
