@@ -176,20 +176,24 @@ class TimeDependentDiffusionPDE:
         # Compute diffusion coefficient
         D = self.diffusion_coefficient(mu_a, mu_s_prime)  # (B, 1, 1, 1)
         
-        # Compute ∇·(D∇Φ) for representative time step (2nd image)
-        center_idx = 1  # Use 2nd image (index 1) as representative
-        phi_center = phi_sequence[:, center_idx]  # (B, H, W)
-        
-        # Expand D to match phi_center shape (B, H, W)
+        # Compute ∇·(D∇Φ) for ALL time steps (not just center)
+        # This ensures PDE residual is computed accurately at each time step
         D_expanded = D.squeeze(1).squeeze(1).squeeze(1)  # (B,)
-        D_expanded = D_expanded.view(B, 1, 1).expand_as(phi_center)  # (B, H, W)
+        D_expanded = D_expanded.view(B, 1, 1)  # (B, 1, 1) for broadcasting
         
-        div_D_grad_phi_center = self.compute_gradient_divergence(
-            phi_center, D_expanded, dx, dy
-        )  # (B, H, W)
+        # Compute div_D_grad_phi for each time step in the residual calculation
+        # Residual uses phi_sequence[:, :-1], so we compute for t=0, 1, 2, ..., T-2
+        div_D_grad_phi_all = []
+        for t in range(T - 1):  # For each time step used in residual (0 to T-2)
+            phi_t = phi_sequence[:, t]  # (B, H, W) - image at time step t
+            D_t = D_expanded.expand(B, H, W)  # (B, H, W) - expand D to match spatial dimensions
+            div_D_grad_phi_t = self.compute_gradient_divergence(
+                phi_t, D_t, dx, dy
+            )  # (B, H, W)
+            div_D_grad_phi_all.append(div_D_grad_phi_t)
         
-        # Expand to match time dimension for residual calculation
-        div_D_grad_phi = div_D_grad_phi_center.unsqueeze(1).expand(-1, T-1, -1, -1)
+        # Stack all time steps: (B, T-1, H, W)
+        div_D_grad_phi = torch.stack(div_D_grad_phi_all, dim=1)
         
         # Compute source term (default to zero if not provided)
         if source is None:

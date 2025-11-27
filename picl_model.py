@@ -325,7 +325,10 @@ class PICLModel(nn.Module):
                 'physics_weight': 1.0,
                 'data_weight': 1.0,
                 'classification_weight': 10.0,  # Classification is primary goal
-                'c': 3e8
+                'c': 3e8,
+                'dx': 1e-3,  # 1.0 mm = 1e-3 m (MCX 설정 기준)
+                'dy': 1e-3,  # 1.0 mm = 1e-3 m
+                'dt': 1e-9,  # 1.0 ns = 1e-9 s
             }
         
         # 1. 2D VMamba Backbone (Spatial Feature Extractor)
@@ -455,13 +458,18 @@ class PICLModel(nn.Module):
         # ========================================
         
         # 3.1. Physics Loss (Data + PDE)
+        # 물리적 단위 사용 (MCX 설정: 픽셀당 1.0mm, 시간 게이트 간격 1ns)
+        dx = self.physics_config.get('dx', 1e-3)  # 1.0 mm = 1e-3 m
+        dy = self.physics_config.get('dy', 1e-3)  # 1.0 mm = 1e-3 m
+        dt = self.physics_config.get('dt', 1e-9)  # 1.0 ns = 1e-9 s
+        
         pinn_loss, loss_dict = self.physics_loss(
             phi_original=phi_sequence,      # Original images for physics
             n_pred=n_pred,                  # Predicted refractive index
             n_true=n_true,                  # True refractive index
             mu_a_pred=mu_a_pred,            # Predicted absorption coefficient
             mu_s_prime_pred=mu_s_prime_pred, # Predicted reduced scattering coefficient
-            dx=1.0, dy=1.0, dt=1.0         # Spatial and temporal steps
+            dx=dx, dy=dy, dt=dt             # Physical units: mm (spatial), ns (temporal)
         )
         
         # 3.2. Classification Loss (직접 분류 경로만)

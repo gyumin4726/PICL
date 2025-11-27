@@ -27,6 +27,10 @@ model = dict(
         physics_weight=1.0,         # Physics loss 가중치 (PDE 제약)
         data_weight=1.0,            # Data loss 가중치 (굴절률 예측)
         classification_weight=10.0, # Classification loss 가중치 (주 목표)
+        # 물리적 단위 (MCX 설정 기준)
+        dx=1e-3,                    # 공간 스텝 x 방향 (1.0 mm = 1e-3 m)
+        dy=1e-3,                    # 공간 스텝 y 방향 (1.0 mm = 1e-3 m)
+        dt=1e-9,                    # 시간 스텝 (1.0 ns = 1e-9 s)
     ),
     
     # Classification Configuration
@@ -62,7 +66,7 @@ data = dict(
 # Training Configuration
 # ========================
 train = dict(
-    epochs=10,
+    epochs=25,
     learning_rate=0.0005,
     weight_decay=0.0001,
     
