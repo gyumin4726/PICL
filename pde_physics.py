@@ -226,7 +226,9 @@ class TimeDependentDiffusionPDE:
             torch.Tensor: Physics loss scalar
         """
         residual = self.pde_residual(phi_sequence, n, mu_a, mu_s_prime, source, dx, dy, dt)
-        loss = weight * torch.mean(residual**2)
+        # Use Huber Loss instead of MSE for robustness to outliers
+        # delta=0.1: threshold between quadratic and linear regions
+        loss = weight * F.huber_loss(residual, torch.zeros_like(residual), delta=0.1, reduction='mean')
         return loss
 
 
@@ -270,8 +272,12 @@ class PINNPhysicsLoss(nn.Module):
         Returns:
             Tuple[torch.Tensor, dict]: Total loss and loss components
         """
-        # Data loss (MSE between predicted and true refractive index)
-        data_loss = F.mse_loss(n_pred, n_true)
+        # Data loss (Huber Loss between predicted and true refractive index)
+        # Huber Loss: robust to outliers, linear penalty for large errors
+        # For |error| < delta: quadratic (like MSE)
+        # For |error| >= delta: linear (like MAE)
+        # delta=0.1: threshold between quadratic and linear regions
+        data_loss = F.huber_loss(n_pred, n_true, delta=0.1, reduction='mean')
         
         # Physics loss (PDE residual using original images and predicted coefficients)
         physics_loss = self.pde.physics_loss(
