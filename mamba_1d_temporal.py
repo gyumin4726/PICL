@@ -1,15 +1,8 @@
-# Copyright (c) 2023, Tri Dao, Albert Gu.
-# Adapted for PICL 1D Temporal Modeling
-
 import math
-import copy
-from functools import partial
-from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 
 from einops import rearrange, repeat
 

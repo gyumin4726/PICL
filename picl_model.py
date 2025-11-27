@@ -263,29 +263,6 @@ class ETFClassifier(nn.Module):
         
         return class_logits, class_pred
     
-    def get_etf_structure(self) -> torch.Tensor:
-        """
-        Return the ETF weight matrix for visualization.
-        
-        Returns:
-            torch.Tensor: ETF weights (num_classes, feature_dim)
-        """
-        return self.etf_head.data
-    
-    def compute_class_similarity(self) -> torch.Tensor:
-        """
-        Compute pairwise cosine similarity between class vectors.
-        
-        For perfect ETF structure, all off-diagonal elements should be -1/(C-1).
-        
-        Returns:
-            torch.Tensor: Similarity matrix (num_classes, num_classes)
-        """
-        W = self.etf_head.data  # (C, D)
-        W_norm = F.normalize(W, p=2, dim=1)  # Normalize rows
-        similarity = torch.mm(W_norm, W_norm.T)  # (C, C)
-        
-        return similarity
 
 
 class PICLModel(nn.Module):

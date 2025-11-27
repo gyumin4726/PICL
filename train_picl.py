@@ -1,18 +1,15 @@
-#!/usr/bin/env python3
 """
 PICL Training Script
 원본 이미지 -> VMamba Backbone -> Feature Maps 학습 파이프라인
 """
 
 import os
-import sys
 import argparse
 import json
 import random
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam, SGD, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR, ReduceLROnPlateau
@@ -20,7 +17,6 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 
-# PICL 모델 import
 from picl_model import PICLModel
 
 

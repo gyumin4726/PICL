@@ -61,7 +61,7 @@ PICL 모델은 **동시에 실행되는 두 개의 독립적인 경로**로 구�
                       ↓
     Residual = (예측값 + 계산값) → 0에 가까워야 함
                       ↓
-    Loss = Data Loss + Physics Loss
+    Loss = Classification Loss + Data Loss + Physics Loss
 ```
 
 ### PATH 1: 신경망 예측 경로 (Neural Network Prediction)
@@ -89,14 +89,19 @@ PICL 모델은 **동시에 실행되는 두 개의 독립적인 경로**로 구�
 - **출력**: `(B, 512)` - 최종 시간적 특징 벡터
 - **구현**: `mamba_1d_temporal.py`의 `SequenceToValue` 클래스
 
-#### 4. **MLP Regressor** (물리계수 예측)
-- **입력**: `(B, 512)` - 시간적 특징 벡터
-- **처리**: 3개의 완전연결층을 통과하여 물리계수 예측
-- **출력**: `(B, 3)` - 3개의 물리계수
-  - `n_pred`: 굴절률 (Refractive Index)
-  - `mu_a_pred`: 흡수 계수 (Absorption Coefficient)
-  - `mu_s_prime_pred`: 등방 환산 산란 계수 (Reduced Scattering Coefficient)
-- **구현**: `picl_model.py`의 `MLPRegressor` 클래스
+#### 4. **병렬 헤드** (물리계수 예측 + 재료 분류)
+- **입력**: `(B, 1024)` - 시간적 특징 벡터
+- **MLP Regressor** (물리계수 예측):
+  - 처리: 3개의 완전연결층을 통과하여 물리계수 예측
+  - 출력: `(B, 3)` - 3개의 물리계수
+    - `n_pred`: 굴절률 (Refractive Index)
+    - `mu_a_pred`: 흡수 계수 (Absorption Coefficient)
+    - `mu_s_prime_pred`: 등방 환산 산란 계수 (Reduced Scattering Coefficient)
+  - 구현: `picl_model.py`의 `MLPRegressor` 클래스
+- **ETF Classifier** (재료 분류):
+  - 처리: Equiangular Tight Frame 기반 분류기
+  - 출력: `(B, 5)` - 5개 재료에 대한 로짓
+  - 구현: `picl_model.py`의 `ETFClassifier` 클래스
 
 ### PATH 2: 물리량 계산 경로 (Physics Quantities Computation)
 
@@ -116,18 +121,20 @@ PICL 모델은 **동시에 실행되는 두 개의 독립적인 경로**로 구�
   - 간격 1: t2-t3
   - 간격 2: t3-t4
   - 간격 3: t4-t5
+- **물리 단위**: `dt=1e-9 s` (1.0 ns) - MCX 시뮬레이션 설정 기준
 - **구현**: `pde_physics.py`의 `compute_time_derivative()` 메서드
 
 #### 3. **공간 미분 계산** (∇·(D∇Φ))
 - **입력**: `(B, 5, 224, 224)` - 플루언스율 시퀀스
-- **대표 시점**: 2번째 이미지 (인덱스 1) 사용
+- **모든 시간 스텝**: 각 시간 스텝(t=0, 1, 2, 3)에 대해 독립적으로 계산
 - **방법**: 유한 차분법 (Central Difference)
   ```python
   ∇Φ = (∂Φ/∂x, ∂Φ/∂y)  # 기울기
   D∇Φ = D × ∇Φ          # 확산 계수 곱하기
   ∇·(D∇Φ) = ∂(D∂Φ/∂x)/∂x + ∂(D∂Φ/∂y)/∂y  # 발산
   ```
-- **출력**: `(B, 224, 224)` - 2번째 시점의 공간 미분 (나중에 4번 복제됨)
+- **출력**: `(B, 4, 224, 224)` - 각 시간 스텝의 공간 미분
+- **물리 단위**: `dx=1e-3 m` (1.0 mm), `dy=1e-3 m` (1.0 mm) - MCX 시뮬레이션 설정 기준
 - **구현**: `pde_physics.py`의 `compute_gradient_divergence()` 메서드
 
 #### 4. **확산 계수 계산** (D)
@@ -159,9 +166,11 @@ PICL 모델은 **동시에 실행되는 두 개의 독립적인 경로**로 구�
 #### 2. **물리 손실** (Physics Loss)
 - **계산**:
   ```python
-  physics_loss = mean(residual^2)
+  physics_loss = HuberLoss(residual, delta=0.1)
   ```
-  - 모든 픽셀의 잔차를 제곱한 후 평균
+  - Huber Loss 사용: 이상치에 강건하며, 큰 오차에 대해 선형 페널티
+  - `delta=0.1`: 이차 영역과 선형 영역 사이의 임계값
+  - 모든 픽셀의 잔차에 대해 Huber Loss 계산 후 평균
   - 총 `B × 4 × 224 × 224` 개의 값에 대해 평균
 - **의미**: 예측된 물리계수가 물리 법칙을 얼마나 잘 만족하는지 측정
   - `physics_loss ≈ 0`: 물리 법칙을 잘 만족
@@ -171,16 +180,27 @@ PICL 모델은 **동시에 실행되는 두 개의 독립적인 경로**로 구�
 #### 3. **데이터 손실** (Data Loss)
 - **계산**:
   ```python
-  data_loss = MSE(n_pred, n_true)
+  data_loss = HuberLoss(n_pred, n_true, delta=0.1)
   ```
 - **의미**: 예측된 굴절률과 실제 굴절률 간의 차이
+- **Huber Loss 사용**: 초기 큰 오차에 대해 더 안정적인 학습
 
-#### 4. **최종 PINN 손실**
+#### 4. **분류 손실** (Classification Loss)
 - **계산**:
   ```python
-  total_loss = data_weight * data_loss + physics_weight * physics_loss
+  classification_loss = CrossEntropy(class_logits, material_label)
   ```
-- **의미**: 데이터 적합도와 물리 법칙 만족도를 균형있게 결합
+- **의미**: 재료 분류 정확도 (ETF Classifier 사용)
+- **가중치**: 기본값 10.0 (주 목표)
+
+#### 5. **최종 PINN 손실**
+- **계산**:
+  ```python
+  total_loss = classification_weight * classification_loss + 
+               data_weight * data_loss + 
+               physics_weight * physics_loss
+  ```
+- **의미**: 분류, 데이터 적합도, 물리 법칙 만족도를 균형있게 결합
 - **구현**: `pde_physics.py`의 `PINNPhysicsLoss` 클래스
 
 ## 📊 데이터셋 구조
@@ -299,41 +319,47 @@ print(f"물리 손실: {results['physics_loss']}")
 n_pred, mu_a_pred, mu_s_prime_pred = model.predict_coefficients(images)
 ```
 
-### 3. 훈련
+### 3. 훈련 및 추론
 
-현재는 훈련 스크립트가 별도로 구현되지 않았습니다. `picl_model.py`를 사용하여 직접 훈련 루프를 작성하실 수 있습니다:
+#### 훈련 실행
+```bash
+# 기본 실행
+python train_picl.py config_picl.py --work-dir work_dirs/picl_vmamba_base --device cuda
 
-```python
-from picl_model import PICLModel
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-
-# 모델 초기화
-model = PICLModel(...)
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-# 훈련 루프
-for epoch in range(num_epochs):
-    for batch in train_loader:
-        images = batch['images']  # (B, 5, 3, 224, 224)
-        n_true = batch['n_true']  # (B,) - 실제 굴절률
-        
-        # Forward pass (손실 포함)
-        results = model(images, n_true)
-        
-        # 역전파
-        optimizer.zero_grad()
-        results['total_loss'].backward()
-        optimizer.step()
-        
-        # 로깅
-        print(f"Epoch {epoch}, Loss: {results['total_loss']:.4f}")
-        print(f"  Data Loss: {results['data_loss']:.4f}")
-        print(f"  Physics Loss: {results['physics_loss']:.4f}")
+# 또는 run_picl.sh 스크립트 사용 (훈련 + 추론 자동 실행)
+bash run_picl.sh
 ```
 
-**참고**: 실제 데이터셋 로더와 훈련 스크립트는 향후 추가 예정입니다.
+#### 훈련 스크립트 기능
+- **데이터 로더**: JSON 파일 기반 데이터셋 자동 로드
+- **체크포인트 저장**:
+  - `best.pth`: 최고 정확도 모델 (갱신 시 저장)
+  - `latest.pth`: 매 epoch마다 저장
+  - `last.pth`: 마지막 epoch 모델
+- **손실 표시**: 가중치가 곱해진 loss 값 표시 (진행바 및 epoch 요약)
+- **학습률 스케줄러**: ReduceLROnPlateau, CosineAnnealingLR, StepLR, MultiStepLR 지원
+
+#### 추론 실행
+```bash
+# 데이터셋 전체에 대해 추론
+python inference_picl.py config_picl.py work_dirs/picl_vmamba_base/best.pth \
+    --mode dataset \
+    --output-dir work_dirs/picl_vmamba_base/inference_results \
+    --device cuda
+
+# 단일 샘플 추론
+python inference_picl.py config_picl.py work_dirs/picl_vmamba_base/best.pth \
+    --mode single \
+    --images img1.png img2.png img3.png img4.png img5.png \
+    --output-dir ./output \
+    --device cuda
+```
+
+#### 추론 결과
+- 재료 분류 정확도 및 혼동 행렬
+- 굴절률 예측 통계 (MSE, MAE)
+- 재료별 상세 통계
+- JSON 형식 결과 저장
 
 ## 🔬 연구 맥락
 
@@ -406,7 +432,16 @@ PICL/
 ├── picl_model.py                   # 완전한 PICL 통합 모델
 │   └── PICLModel: PATH 1 + PATH 2 통합 클래스
 │   └── MLPRegressor: 물리계수 예측 헤드
+│   └── ETFClassifier: 재료 분류 헤드
 │   └── 전체 파이프라인 자동 실행
+├── train_picl.py                   # 훈련 스크립트
+│   └── 데이터 로더, 훈련 루프, 체크포인트 저장
+├── inference_picl.py               # 추론 스크립트
+│   └── 데이터셋/단일 샘플 추론, 통계 계산
+├── config_picl.py                  # 설정 파일
+│   └── 모델, 데이터, 훈련 설정
+├── run_picl.sh                     # 실행 스크립트
+│   └── 훈련 + 추론 자동 실행
 ├── train/                          # 훈련 데이터셋
 │   ├── air_4D/images/             # 5장의 시간 게이트 이미지
 │   ├── water_4D/images/
@@ -465,8 +500,14 @@ PICL/
   - 굴절률 (n): 1.0 ~ 1.77
   - 흡수 계수 (μa): 0.01 ~ 0.1 mm⁻¹
   - 등방 환산 산란 계수 (μs'): 0.5 ~ 2.0 mm⁻¹
-- **아키텍처**: VMamba + 1D Mamba + MLP Regressor + PINN 손실
-- **손실 함수**: Data Loss (MSE) + Physics Loss (PDE residual)
+- **아키텍처**: VMamba + 1D Mamba + MLP Regressor + ETF Classifier + PINN 손실
+- **손실 함수**: 
+  - Classification Loss (CrossEntropy) - 가중치: 10.0
+  - Data Loss (Huber Loss, delta=0.1) - 가중치: 1.0
+  - Physics Loss (Huber Loss, delta=0.1) - 가중치: 0.01
+- **물리 단위**: 
+  - 공간: `dx=dy=1e-3 m` (1.0 mm)
+  - 시간: `dt=1e-9 s` (1.0 ns)
 
 ## ✅ 구현 상태
 
@@ -487,25 +528,36 @@ PICL/
 
 #### 기능
 - ✅ 3가지 물리계수 예측 (n, μa, μs')
+- ✅ 재료 분류 (ETF Classifier)
 - ✅ 원본 이미지에서 물리량 계산
 - ✅ PDE 방정식 검증
 - ✅ 물리 손실 자동 계산
+- ✅ Huber Loss 적용 (데이터 및 물리 손실)
+- ✅ 물리 단위 통합 (dx, dy, dt)
+- ✅ 모든 시간 스텝에서 공간 미분 계산
 
-### 미완성 / 향후 추가 필요
-
-- ❌ **훈련 스크립트**: 전체 훈련 루프
-- ❌ **데이터 로더**: PICL 데이터셋용 DataLoader
-- ❌ **평가 스크립트**: 물리계수 예측 평가 코드
-- ❌ **체크포인트 저장/로딩**: 모델 저장 기능
+#### 훈련 및 추론 도구
+- ✅ **train_picl.py**: 완전한 훈련 스크립트
+  - 데이터 로더 (JSON 기반)
+  - 체크포인트 저장 (best, latest, last)
+  - 가중치가 곱해진 loss 표시
+  - 학습률 스케줄러 지원
+- ✅ **inference_picl.py**: 추론 스크립트
+  - 데이터셋 전체 추론
+  - 단일 샘플 추론
+  - 상세 통계 및 결과 저장
+- ✅ **run_picl.sh**: 훈련 + 추론 자동 실행 스크립트
 
 ## 🔮 향후 연구
 
 1. ✅ **물리 손실 통합**: 시간 의존 확산 방정식 완료
-2. **연속 학습**: 순차적 재료 학습을 위한 FSCIL 구현
-3. **공간 미분 개선**: 모든 시간 스텝에 대해 공간 미분 계산 (현재는 대표 시점만)
-4. **Source Term 모델링**: 광원 항(S)을 동적으로 예측하거나 더 정확히 모델링
-5. **실시간 처리**: 실제 응용을 위한 최적화
-6. **다중 물리 방정식**: 다른 물리 법칙 추가 통합
+2. ✅ **공간 미분 개선**: 모든 시간 스텝에 대해 공간 미분 계산 완료
+3. ✅ **Huber Loss 적용**: 데이터 및 물리 손실에 Huber Loss 적용 완료
+4. ✅ **물리 단위 통합**: 실제 물리 단위 (mm, ns) 적용 완료
+5. **연속 학습**: 순차적 재료 학습을 위한 FSCIL 구현
+6. **Source Term 모델링**: 광원 항(S)을 동적으로 예측하거나 더 정확히 모델링
+7. **실시간 처리**: 실제 응용을 위한 최적화
+8. **다중 물리 방정식**: 다른 물리 법칙 추가 통합
 
 ## 🔑 핵심 개념 정리
 

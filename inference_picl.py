@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 PICL Inference Script
 학습된 모델로 물리 계수 예측 및 피처맵 추출
@@ -6,8 +5,6 @@ PICL Inference Script
 
 import os
 import argparse
-from pathlib import Path
-
 import torch
 import numpy as np
 from PIL import Image

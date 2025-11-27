@@ -1,6 +1,3 @@
-# PICL (Physics-Informed Contrastive Learning) Configuration
-# 원본 이미지 -> VMamba Backbone -> Feature Maps 파이프라인
-
 # ========================
 # Model Configuration
 # ========================
