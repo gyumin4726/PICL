@@ -66,19 +66,6 @@ def extract_features(model, images, device):
         return features
 
 
-def predict_coefficients(model, images, device):
-    """물리 계수 예측"""
-    with torch.no_grad():
-        images = images.to(device)
-        n_pred, mu_a_pred, mu_s_prime_pred = model.predict_coefficients(images)
-    
-    return {
-        'n': n_pred.cpu().numpy(),
-        'mu_a': mu_a_pred.cpu().numpy(),
-        'mu_s_prime': mu_s_prime_pred.cpu().numpy()
-    }
-
-
 def predict_material(model, images, device):
     """재료 분류 및 물리 계수 예측"""
     with torch.no_grad():

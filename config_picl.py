@@ -81,12 +81,6 @@ train = dict(
         min_lr=1e-6      # 최소 학습률
     ),
     
-    # Checkpoint
-    save_interval=10,  # 10 epoch마다 저장
-    save_best=True,    # Best model 저장
-    
-    # Logging
-    log_interval=10,   # 10 iteration마다 로그 출력
 )
 
 # ========================
@@ -97,14 +91,4 @@ device = 'cuda'  # 'cuda' or 'cpu'
 seed = 42        # Random seed
 deterministic = True  # 재현성을 위한 deterministic 모드
 
-# GPU 설정
-gpu_ids = [0]  # 사용할 GPU ID 리스트
-
-# Logging
-log_level = 'INFO'  # 'DEBUG', 'INFO', 'WARNING', 'ERROR'
-log_file = None     # None이면 work_dir에 자동 생성
-
-# Resume training
-resume_from = None  # checkpoint 경로 (None이면 처음부터 학습)
-load_from = None    # pretrained model 경로 (fine-tuning용)
 
