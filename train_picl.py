@@ -282,17 +282,37 @@ def main():
     seed = config.get('seed', 42)
     deterministic = config.get('deterministic', True)
     
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    def set_seed(seed_value):
+        """재현성을 위한 seed 설정 함수"""
+        random.seed(seed_value)
+        np.random.seed(seed_value)
+        torch.manual_seed(seed_value)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed_value)
+            torch.cuda.manual_seed_all(seed_value)
+        if deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            # CUDA 비결정적 연산 방지 (성능 저하 가능하지만 재현성 보장)
+            os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'  # CUDA 10.2+
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except:
+                pass  # PyTorch 버전에 따라 지원되지 않을 수 있음
     
+    set_seed(seed)
     print(f"Random seed: {seed}, Deterministic: {deterministic}")
+    
+    # DataLoader용 generator 생성 (재현성을 위해)
+    def worker_init_fn(worker_id):
+        """DataLoader worker의 seed 설정"""
+        worker_seed = seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+    
+    # Generator for DataLoader (재현성 보장)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
     
     # Work directory 설정
     work_dir = args.work_dir if args.work_dir else config['work_dir']
@@ -314,7 +334,9 @@ def main():
         train_dataset,
         batch_size=config['data']['train']['batch_size'],
         shuffle=config['data']['train']['shuffle'],
-        num_workers=config['data']['train']['num_workers']
+        num_workers=config['data']['train']['num_workers'],
+        generator=generator,  # 재현성을 위한 generator
+        worker_init_fn=worker_init_fn  # Worker seed 설정
     )
     
     # Test 데이터셋을 validation으로 사용 (별도 validation dataset 없음)
@@ -334,8 +356,10 @@ def main():
     print(f"Train samples: {len(train_dataset)}")
     print(f"Test samples (used for validation): {len(test_dataset)}")
     
-    # 모델 생성
+    # 모델 생성 (seed 설정 이후에 생성하여 ETF 가중치 초기화 시 재현성 보장)
     print("\n=== Building Model ===")
+    # 모델 생성 전에 seed 재확인 (ETF 가중치 초기화를 위해)
+    set_seed(seed)
     model = PICLModel(
         backbone_model=config['model']['backbone']['model_name'],
         pretrained_path=config['model']['backbone']['pretrained_path'],
@@ -378,6 +402,10 @@ def main():
     print("=== Training ===")
     print("="*70)
     for epoch in range(start_epoch, config['train']['epochs']):
+        # Epoch마다 generator seed 업데이트 (재현성 보장)
+        # FSCIL의 DistSamplerSeedHook과 동일한 방식: seed + epoch
+        generator.manual_seed(seed + epoch)
+        
         # 1. Train
         avg_loss, avg_data_loss, avg_physics_loss, avg_cls_loss, train_accuracy = train_epoch(
             model, train_loader, optimizer, device, epoch
