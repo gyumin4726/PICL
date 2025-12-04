@@ -22,8 +22,11 @@ model = dict(
     physics=dict(
         c=3e8,                      # 광속 (m/s)
         physics_weight=0.01,         # Physics loss 가중치 (PDE 제약)
-        data_weight=1.0,            # Data loss 가중치 (굴절률 예측)
+        data_weight=10.0,            # Data loss 가중치 (굴절률 예측)
         classification_weight=10.0, # Classification loss 가중치 (주 목표)
+        # CombinedLoss 가중치 (DRLoss + CrossEntropyLoss)
+        dr_weight=1.0,              # DRLoss 가중치 (0.0: 사용 안 함, 1.0: DRLoss만 사용)
+        ce_weight=0.0,              # CrossEntropyLoss 가중치 (1.0: CE Loss만 사용)
         # 물리적 단위 (MCX 설정 기준)
         dx=1e-3,                    # 공간 스텝 x 방향 (1.0 mm = 1e-3 m)
         dy=1e-3,                    # 공간 스텝 y 방향 (1.0 mm = 1e-3 m)
