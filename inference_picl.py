@@ -88,7 +88,7 @@ def inference_on_dataset(model, dataset, device, save_dir):
     
     print("\n=== Running Inference ===")
     for idx in tqdm(range(len(dataset))):
-        images, n_true, material_label = dataset[idx]
+        images, n_true, mu_a_true, mu_s_true, g_true, tissue_label = dataset[idx]
         images = images.unsqueeze(0)  # Add batch dimension
         
         # 재료 분류 및 물리 계수 예측
@@ -97,16 +97,16 @@ def inference_on_dataset(model, dataset, device, save_dir):
         # 피처맵 추출
         features = extract_features(model, images, device)
         
-        # Material name mapping
-        material_label_idx = int(material_label.numpy())
-        material_name = OpticalScatteringDataset.IDX_TO_MATERIAL.get(material_label_idx, 'unknown')
-        pred_material_idx = int(preds['class_pred'][0])
-        pred_material_name = OpticalScatteringDataset.IDX_TO_MATERIAL.get(pred_material_idx, 'unknown')
+        # Tissue name mapping
+        tissue_label_idx = int(tissue_label.numpy())
+        tissue_name = OpticalScatteringDataset.IDX_TO_TISSUE.get(tissue_label_idx, 'unknown')
+        pred_tissue_idx = int(preds['class_pred'][0])
+        pred_tissue_name = OpticalScatteringDataset.IDX_TO_TISSUE.get(pred_tissue_idx, 'unknown')
         
         result = {
             'idx': idx,
-            'material_true': material_name,
-            'material_pred': pred_material_name,
+            'tissue_true': tissue_name,
+            'tissue_pred': pred_tissue_name,
             'class_probs': preds['class_probs'][0].tolist(),
             'n_true': float(n_true.numpy()),
             'n_pred': float(preds['n'][0]),
@@ -124,7 +124,7 @@ def inference_on_dataset(model, dataset, device, save_dir):
     mae = np.mean([abs(t - p) for t, p in zip(n_true_list, n_pred_list)])
     
     # Classification accuracy
-    correct = sum(1 for r in results if r['material_true'] == r['material_pred'])
+    correct = sum(1 for r in results if r['tissue_true'] == r['tissue_pred'])
     accuracy = 100.0 * correct / len(results)
     
     print(f"\n=== Results ===")
@@ -136,48 +136,48 @@ def inference_on_dataset(model, dataset, device, save_dir):
     print(f"  MAE: {mae:.6f}")
     
     # 클래스별 통계
-    print(f"\n=== Material-wise Results ===")
-    materials = sorted(set([r['material_true'] for r in results]))
+    print(f"\n=== Tissue-wise Results ===")
+    tissues = sorted(set([r['tissue_true'] for r in results]))
     
     # Header
-    print(f"{'Material':<12} {'Count':<7} {'Accuracy':<10} {'n_true':<8} {'n_pred':<15} {'MSE':<10} {'MAE':<10}")
-    print("-" * 90)
+    print(f"{'Tissue':<20} {'Count':<7} {'Accuracy':<10} {'n_true':<8} {'n_pred':<15} {'MSE':<10} {'MAE':<10}")
+    print("-" * 100)
     
-    for mat in materials:
-        mat_results = [r for r in results if r['material_true'] == mat]
-        mat_correct = sum(1 for r in mat_results if r['material_true'] == r['material_pred'])
-        mat_accuracy = 100.0 * mat_correct / len(mat_results)
+    for tissue in tissues:
+        tissue_results = [r for r in results if r['tissue_true'] == tissue]
+        tissue_correct = sum(1 for r in tissue_results if r['tissue_true'] == r['tissue_pred'])
+        tissue_accuracy = 100.0 * tissue_correct / len(tissue_results)
         
-        mat_n_true = [r['n_true'] for r in mat_results]
-        mat_n_pred = [r['n_pred'] for r in mat_results]
-        mat_mse = np.mean([(t - p)**2 for t, p in zip(mat_n_true, mat_n_pred)])
-        mat_mae = np.mean([abs(t - p) for t, p in zip(mat_n_true, mat_n_pred)])
+        tissue_n_true = [r['n_true'] for r in tissue_results]
+        tissue_n_pred = [r['n_pred'] for r in tissue_results]
+        tissue_mse = np.mean([(t - p)**2 for t, p in zip(tissue_n_true, tissue_n_pred)])
+        tissue_mae = np.mean([abs(t - p) for t, p in zip(tissue_n_true, tissue_n_pred)])
         
-        print(f"{mat:<12} {len(mat_results):<7} {mat_accuracy:>6.1f}%    "
-              f"{mat_n_true[0]:.2f}     {np.mean(mat_n_pred):.4f}±{np.std(mat_n_pred):.4f}  "
-              f"{mat_mse:.6f}  {mat_mae:.6f}")
+        print(f"{tissue:<20} {len(tissue_results):<7} {tissue_accuracy:>6.1f}%    "
+              f"{tissue_n_true[0]:.2f}     {np.mean(tissue_n_pred):.4f}±{np.std(tissue_n_pred):.4f}  "
+              f"{tissue_mse:.6f}  {tissue_mae:.6f}")
     
     # Confusion Matrix
     print(f"\n=== Confusion Matrix ===")
     from collections import defaultdict
     confusion = defaultdict(lambda: defaultdict(int))
     for r in results:
-        confusion[r['material_true']][r['material_pred']] += 1
+        confusion[r['tissue_true']][r['tissue_pred']] += 1
     
     # Print header
     header_label = "True \\ Pred"
-    print(f"{header_label:<12}", end="")
-    for mat in materials:
-        print(f"{mat:<10}", end="")
+    print(f"{header_label:<20}", end="")
+    for tissue in tissues:
+        print(f"{tissue:<20}", end="")
     print()
-    print("-" * (12 + 10 * len(materials)))
+    print("-" * (20 + 20 * len(tissues)))
     
     # Print rows
-    for true_mat in materials:
-        print(f"{true_mat:<12}", end="")
-        for pred_mat in materials:
-            count = confusion[true_mat][pred_mat]
-            print(f"{count:<10}", end="")
+    for true_tissue in tissues:
+        print(f"{true_tissue:<20}", end="")
+        for pred_tissue in tissues:
+            count = confusion[true_tissue][pred_tissue]
+            print(f"{count:<20}", end="")
         print()
     
     # 결과 저장
@@ -213,16 +213,16 @@ def inference_single_sample(model, image_paths, device):
     # 피처맵 추출
     features = extract_features(model, images, device)
     
-    # Material name
-    pred_material_idx = int(preds['class_pred'][0])
-    pred_material_name = OpticalScatteringDataset.IDX_TO_MATERIAL.get(pred_material_idx, 'unknown')
+    # Tissue name
+    pred_tissue_idx = int(preds['class_pred'][0])
+    pred_tissue_name = OpticalScatteringDataset.IDX_TO_TISSUE.get(pred_tissue_idx, 'unknown')
     
     print(f"\n📊 Classification:")
-    print(f"  Predicted Material: {pred_material_name} (class {pred_material_idx})")
+    print(f"  Predicted Tissue: {pred_tissue_name} (class {pred_tissue_idx})")
     print(f"  Class Probabilities:")
     for idx, prob in enumerate(preds['class_probs'][0]):
-        mat_name = OpticalScatteringDataset.IDX_TO_MATERIAL.get(idx, 'unknown')
-        print(f"    {mat_name:<10}: {prob:.4f} ({prob*100:.1f}%)")
+        tissue_name = OpticalScatteringDataset.IDX_TO_TISSUE.get(idx, 'unknown')
+        print(f"    {tissue_name:<20}: {prob:.4f} ({prob*100:.1f}%)")
     
     print(f"\n📐 Physical Coefficients:")
     print(f"  Refractive index (n):            {preds['n'][0]:.4f}")
