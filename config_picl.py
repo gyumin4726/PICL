@@ -34,7 +34,7 @@ model = dict(
     ),
     
     # Classification Configuration
-    num_classes=5,  # 5개 재료: air, water, acrylic, glass, sapphire
+    num_classes=5,  # Base 5종 조직: epidermis, dermis, subcutaneous_fat, muscle, whole_blood
 )
 
 # ========================
@@ -44,7 +44,7 @@ data = dict(
     # Training dataset
     train=dict(
         data_root='./train',
-        label_file='./train/dataset_labels.json',  # JSON 파일에서 레이블 로드
+        label_file='./train/dataset_labels_train.json',  # JSON 파일에서 레이블 로드
         image_size=224,
         batch_size=8,
         num_workers=4,

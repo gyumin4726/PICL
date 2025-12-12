@@ -27,16 +27,13 @@ class OpticalScatteringDataset(Dataset):
     JSON 파일에서 레이블 정보를 로드합니다.
     """
     
-    # Material name to class index mapping
-    MATERIAL_TO_IDX = {
-        'air': 0,
-        'water': 1,
-        'acrylic': 2,
-        'glass': 3,
-        'sapphire': 4
-    }
+    # Base 5종 조직 정의
+    BASE_TISSUES = ['epidermis', 'dermis', 'subcutaneous_fat', 'muscle', 'whole_blood']
     
-    IDX_TO_MATERIAL = {v: k for k, v in MATERIAL_TO_IDX.items()}
+    # Tissue name to class index mapping (Base 5종만)
+    TISSUE_TO_IDX = {tissue: idx for idx, tissue in enumerate(BASE_TISSUES)}
+    
+    IDX_TO_TISSUE = {v: k for k, v in TISSUE_TO_IDX.items()}
     
     def __init__(self, data_root, label_file, image_size=224, transform=None):
         self.data_root = Path(data_root)
@@ -49,19 +46,27 @@ class OpticalScatteringDataset(Dataset):
         self._load_from_json()
     
     def _load_from_json(self):
-        """JSON 파일에서 데이터 샘플 로드"""
-        with open(self.label_file, 'r') as f:
+        """JSON 파일에서 데이터 샘플 로드 (Base 5종 조직만 필터링)"""
+        with open(self.label_file, 'r', encoding='utf-8') as f:
             dataset_info = json.load(f)
         
+        # Base 5종 조직만 필터링
+        base_samples = [
+            sample for sample in dataset_info['samples']
+            if sample.get('tissue') in self.BASE_TISSUES
+        ]
+        
         # 각 샘플에 대해 이미지 경로 구성
-        for sample in dataset_info['samples']:
+        for sample in base_samples:
             sample_id = sample['sample_id']
-            material = sample['material']
-            n_value = sample['refractive_index']
+            tissue = sample['tissue']  # material -> tissue로 변경
+            n_value = sample.get('refractive_index', sample.get('n', 1.4))
+            mu_a_value = sample.get('mu_a', 0.0)
+            mu_s_value = sample.get('mu_s', 0.0)
+            g_value = sample.get('g', 0.0)
             base_path = sample['base_path']
             
             # 5개의 시간 게이트 이미지 경로 생성
-            # 실제 구조: air_4D/images/air001/air001_1.png ~ air001_5.png
             time_gates = []
             for gate_idx in range(1, 6):  # 1~5
                 img_path = self.data_root / base_path / f"{sample_id}_{gate_idx}.png"
@@ -71,12 +76,15 @@ class OpticalScatteringDataset(Dataset):
             if all(img_path.exists() for img_path in time_gates):
                 self.samples.append({
                     'images': time_gates,
-                    'class': material,
+                    'class': tissue,  # tissue를 class로 사용 (기존 material 대신)
                     'n_true': n_value,
+                    'mu_a_true': mu_a_value,
+                    'mu_s_true': mu_s_value,
+                    'g_true': g_value,
                     'sample_id': sample_id
                 })
         
-        print(f"Loaded {len(self.samples)} samples from {self.label_file}")
+        print(f"Loaded {len(self.samples)} samples from {self.label_file} (Base 5 tissues only)")
     
     def __len__(self):
         return len(self.samples)
@@ -97,14 +105,17 @@ class OpticalScatteringDataset(Dataset):
         images = images.permute(0, 3, 1, 2)  # (5, 3, H, W) - [시퀀스, 채널, H, W]
         
         n_true = torch.tensor(sample['n_true'], dtype=torch.float32)
+        mu_a_true = torch.tensor(sample['mu_a_true'], dtype=torch.float32)
+        mu_s_true = torch.tensor(sample['mu_s_true'], dtype=torch.float32)
+        g_true = torch.tensor(sample['g_true'], dtype=torch.float32)
         
-        # Material class to index
-        material_class = sample['class']
-        material_idx = self.MATERIAL_TO_IDX.get(material_class, 0)
-        material_label = torch.tensor(material_idx, dtype=torch.long)
+        # Tissue class to index (Base 5종 기준)
+        tissue_class = sample['class']
+        tissue_idx = self.TISSUE_TO_IDX.get(tissue_class, 0)
+        tissue_label = torch.tensor(tissue_idx, dtype=torch.long)
         
         # 5개 시퀀스 => 1개 예측값
-        return images, n_true, material_label
+        return images, n_true, mu_a_true, mu_s_true, g_true, tissue_label
 
 
 def load_config(config_path):
@@ -178,13 +189,16 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
     w_physics = model.physics_config.get('physics_weight', 1.0)
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
-    for images, n_true, material_label in pbar:
+    for images, n_true, mu_a_true, mu_s_true, g_true, tissue_label in pbar:
         images = images.to(device)
         n_true = n_true.to(device)
-        material_label = material_label.to(device)
+        mu_a_true = mu_a_true.to(device)
+        mu_s_true = mu_s_true.to(device)
+        g_true = g_true.to(device)
+        tissue_label = tissue_label.to(device)
         
         # Forward pass
-        results = model(images, n_true, material_label)
+        results = model(images, n_true, tissue_label, mu_a_true=mu_a_true, mu_s_true=mu_s_true, g_true=g_true)
         
         loss = results['total_loss']
         data_loss = results['data_loss']
@@ -204,8 +218,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         total_cls_loss += cls_loss.item()
         
         # Accuracy
-        correct += (class_pred == material_label).sum().item()
-        total_samples += material_label.size(0)
+        correct += (class_pred == tissue_label).sum().item()
+        total_samples += tissue_label.size(0)
         
         # 가중치가 곱해진 loss 값 표시
         pbar.set_postfix({
@@ -236,20 +250,23 @@ def validate(model, dataloader, device):
     class_labels = []
     
     with torch.no_grad():
-        for images, n_true, material_label in tqdm(dataloader, desc="Validating"):
+        for images, n_true, mu_a_true, mu_s_true, g_true, tissue_label in tqdm(dataloader, desc="Validating"):
             images = images.to(device)
             n_true = n_true.to(device)
-            material_label = material_label.to(device)
+            mu_a_true = mu_a_true.to(device)
+            mu_s_true = mu_s_true.to(device)
+            g_true = g_true.to(device)
+            tissue_label = tissue_label.to(device)
             
             # Forward pass
-            results = model(images, n_true, material_label)
+            results = model(images, n_true, tissue_label, mu_a_true=mu_a_true, mu_s_true=mu_s_true, g_true=g_true)
             
             total_loss += results['total_loss'].item()
             total_cls_loss += results['classification_loss'].item()
             predictions.extend(results['n_pred'].cpu().numpy())
             ground_truths.extend(n_true.cpu().numpy())
             class_predictions.extend(results['etf_class_pred'].cpu().numpy())  # ETF Classifier의 분류 결과
-            class_labels.extend(material_label.cpu().numpy())
+            class_labels.extend(tissue_label.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
     avg_cls_loss = total_cls_loss / len(dataloader)
