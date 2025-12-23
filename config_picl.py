@@ -21,8 +21,8 @@ model = dict(
     # Physics Loss Configuration
     physics=dict(
         c=3e8,                      # 광속 (m/s)
-        physics_weight=0.01,         # Physics loss 가중치 (PDE 제약)
-        data_weight=10.0,            # Data loss 가중치 (굴절률 예측)
+        physics_weight=0.0,         # Physics loss 가중치 (PDE 제약)
+        data_weight=1.0,            # Data loss 가중치 (굴절률 예측)
         classification_weight=10.0, # Classification loss 가중치 (주 목표)
         # CombinedLoss 가중치 (DRLoss + CrossEntropyLoss)
         dr_weight=1.0,              # DRLoss 가중치 (0.0: 사용 안 함, 1.0: DRLoss만 사용)
@@ -67,7 +67,7 @@ data = dict(
 # ========================
 train = dict(
     epochs=25,
-    learning_rate=0.0005,
+    learning_rate=0.0002,
     weight_decay=0.0001,
     
     # Optimizer
