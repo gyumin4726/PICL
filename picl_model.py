@@ -148,60 +148,94 @@ class CombinedLoss(nn.Module):
         return total_loss
 
 
-class MLPRegressor(nn.Module):
+class FTTransformerRegressor(nn.Module):
     """
-    MLP Regressor for Physical Coefficients Prediction with Separate Heads.
+    Feature Tokenizer Transformer for Physical Coefficients Prediction.
     
-    Uses multi-task learning architecture:
-    - Shared backbone: Learns common features from temporal representations
-    - Separate heads: Independently predict each physical coefficient
+    FT-Transformer architecture for tabular/feature data:
+    1. Tokenize input features into multiple tokens
+    2. Add learnable positional embeddings
+    3. Transformer encoder to model feature interactions
+    4. Single head outputs all 4 coefficients jointly
     
-    This design avoids gradient conflicts between coefficients with different:
-    - Value scales: n ∈ [1.33, 1.50], μₐ ∈ [0.0005, 0.50], μₛ ∈ [0.005, 50.0], g ∈ [0.89, 0.95]
-    - All coefficients have Data Loss supervision
+    This design learns relationships between feature dimensions and
+    physical coefficients simultaneously, capturing inter-coefficient
+    dependencies naturally.
     
     Architecture:
         Input (B, 1024)
             ↓
-        Shared MLP: 1024 → 256 (common features)
+        Feature Tokenizer: 1024 → num_tokens × d_token
             ↓
-            ├─→ Head_n:  256 → 1 (refractive index)
-            ├─→ Head_μₐ: 256 → 1 (absorption coefficient)
-            ├─→ Head_μₛ: 256 → 1 (scattering coefficient)
-            └─→ Head_g: 256 → 1 (anisotropy factor)
+        [CLS] token prepended (no positional encoding!)
+            ↓
+        Transformer Encoder (n_layers)
+            ↓
+        [CLS] token output
+            ↓
+        Single Head: d_token → 4 (n, μₐ, μₛ, g)
     
     Args:
         input_dim (int): Input feature dimension (default: 1024)
-        hidden_dim (int): Shared backbone output dimension (default: 256)
-        dropout (float): Dropout rate for regularization (default: 0.5)
+        d_token (int): Token embedding dimension (default: 192)
+        n_layers (int): Number of transformer layers (default: 3)
+        n_heads (int): Number of attention heads (default: 8)
+        dropout (float): Dropout rate (default: 0.1)
+        ffn_factor (float): FFN expansion factor (default: 4/3)
     """
     
-    def __init__(self, input_dim: int = 1024, hidden_dim: int = 256, dropout: float = 0.5):
+    def __init__(
+        self, 
+        input_dim: int = 1024,
+        d_token: int = 192,
+        n_layers: int = 3,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        ffn_factor: float = 4/3
+    ):
         super().__init__()
         
-        # Shared backbone for common feature extraction
-        self.shared_backbone = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
+        self.input_dim = input_dim
+        self.d_token = d_token
         
-        # Separate heads for each physical coefficient
-        self.head_n = nn.Linear(hidden_dim, 1)      # Refractive index
-        self.head_mu_a = nn.Linear(hidden_dim, 1)   # Absorption coefficient
-        self.head_mu_s = nn.Linear(hidden_dim, 1)   # Scattering coefficient
-        self.head_g = nn.Linear(hidden_dim, 1)      # Anisotropy factor
+        # Feature tokenizer: split 1024 into tokens
+        # 1024 = 16 tokens × 64 dim each
+        self.num_tokens = 16
+        self.token_dim = input_dim // self.num_tokens  # 64
+        
+        # Linear projection for each token
+        self.token_embedding = nn.Linear(self.token_dim, d_token)
+        
+        # [CLS] token for aggregation
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_token))
+        
+        # No positional embeddings needed!
+        # 우리는 feature vector를 분할한 것이므로 토큰 순서에 의미 없음
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_token,
+            nhead=n_heads,
+            dim_feedforward=int(d_token * ffn_factor),
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True  # Pre-LN for better training
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        # Output head: single head for all 4 coefficients
+        self.output_head = nn.Sequential(
+            nn.LayerNorm(d_token),
+            nn.Linear(d_token, d_token // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_token // 2, 4)  # Output: [n, μₐ, μₛ, g]
+        )
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for physical coefficients prediction.
-        
-        Process:
-        1. Extract common features via shared backbone
-        2. Independently predict each coefficient via separate heads
         
         Args:
             x (torch.Tensor): Input features (B, input_dim)
@@ -213,14 +247,32 @@ class MLPRegressor(nn.Module):
                 - mu_s_pred: (B,) Scattering coefficient [0.005 ~ 50.0]
                 - g_pred: (B,) Anisotropy factor [0.89 ~ 0.95]
         """
-        # Shared feature extraction
-        shared_features = self.shared_backbone(x)  # (B, hidden_dim)
+        B = x.shape[0]
         
-        # Independent predictions for each coefficient
-        n_pred = self.head_n(shared_features).squeeze(-1)      # (B,)
-        mu_a_pred = self.head_mu_a(shared_features).squeeze(-1)  # (B,)
-        mu_s_pred = self.head_mu_s(shared_features).squeeze(-1)  # (B,)
-        g_pred = self.head_g(shared_features).squeeze(-1)        # (B,)
+        # 1. Feature tokenization: (B, 1024) → (B, 16, 64)
+        x_reshaped = x.view(B, self.num_tokens, self.token_dim)
+        
+        # 2. Token embedding: (B, 16, 64) → (B, 16, d_token)
+        tokens = self.token_embedding(x_reshaped)  # (B, 16, 192)
+        
+        # 3. Prepend [CLS] token: (B, 16, 192) → (B, 17, 192)
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, 192)
+        tokens = torch.cat([cls_tokens, tokens], dim=1)  # (B, 17, 192)
+        
+        # 4. Transformer encoder (no positional embedding - token order doesn't matter!)
+        encoded = self.transformer(tokens)  # (B, 17, 192)
+        
+        # 5. Extract [CLS] token output
+        cls_output = encoded[:, 0, :]  # (B, 192)
+        
+        # 6. Single head prediction
+        outputs = self.output_head(cls_output)  # (B, 4)
+        
+        # 7. Split outputs
+        n_pred = outputs[:, 0]
+        mu_a_pred = outputs[:, 1]
+        mu_s_pred = outputs[:, 2]
+        g_pred = outputs[:, 3]
         
         return n_pred, mu_a_pred, mu_s_pred, g_pred
 
@@ -441,11 +493,13 @@ class PICLModel(nn.Module):
         # Temporal feature dimension: 1024
         temporal_feature_dim = temporal_config['input_dim']  # 1024
         
-        # 3. MLP Regressor (Physical Coefficients Predictor)
-        self.regressor = MLPRegressor(
+        # 3. FT-Transformer Regressor (Physical Coefficients Predictor)
+        self.regressor = FTTransformerRegressor(
             input_dim=temporal_feature_dim,  # 1024
-            hidden_dim=256,
-            dropout=0.5
+            d_token=192,
+            n_layers=3,
+            n_heads=8,
+            dropout=0.1
         )
         
         # 4. ETF Classifier (Material Classification directly from temporal features)
@@ -537,7 +591,7 @@ class PICLModel(nn.Module):
         temporal_features = temporal_features_all[:, -1, :]  # (B, 1024)
         
         # 3. 병렬 경로: 물리계수 예측 + ETF 분류
-        # 경로 1: MLP Regressor → 4개 계수 예측
+        # 경로 1: FT-Transformer Regressor → 4개 계수 예측
         n_pred, mu_a_pred, mu_s_pred, g_pred = self.regressor(temporal_features)
         
         # 경로 2: ETF Classifier로 분류 (temporal features에서 직접 분류)
@@ -698,13 +752,13 @@ class PICLModel(nn.Module):
             temporal_features_all = self.temporal(features_projected)
             temporal_features = temporal_features_all[:, -1, :]
             
-            # 4. MLP Regressor
+            # 4. FT-Transformer Regressor
             n_pred, mu_a_pred, mu_s_pred, g_pred = self.regressor(temporal_features)
             mu_s_prime_pred = mu_s_pred * (1 - g_pred)  # mu_s' = mu_s * (1 - g)
             
             return n_pred, mu_a_pred, mu_s_prime_pred
     
-    def predict_material(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def predict_material(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Predict material classification and physical coefficients.
         
@@ -712,10 +766,14 @@ class PICLModel(nn.Module):
             images (torch.Tensor): Image sequence (B, 5, 3, 224, 224)
             
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
+            Dict containing:
                 - class_logits: (B, num_classes) - ETF classification logits
                 - class_pred: (B,) - Predicted class indices
-                - physical_coeffs: (B, 3) - [n, μₐ, μₛ']
+                - n_pred: (B,) - Refractive index
+                - mu_a_pred: (B,) - Absorption coefficient
+                - mu_s_pred: (B,) - Scattering coefficient
+                - g_pred: (B,) - Anisotropy factor
+                - mu_s_prime_pred: (B,) - Reduced scattering coefficient
         """
         with torch.no_grad():
             B, T, C, H, W = images.shape
@@ -746,11 +804,18 @@ class PICLModel(nn.Module):
             # 4. Get physical coefficients
             n_pred, mu_a_pred, mu_s_pred, g_pred = self.regressor(temporal_features)
             mu_s_prime_pred = mu_s_pred * (1 - g_pred)  # mu_s' = mu_s * (1 - g)
-            physical_coeffs = torch.stack([n_pred, mu_a_pred, mu_s_prime_pred], dim=1)  # (B, 3)
             
             # 5. ETF Classifier
             class_logits, class_pred = self.etf_classifier(temporal_features)
             
-            return class_logits, class_pred, physical_coeffs
+            return {
+                'class_logits': class_logits,
+                'class_pred': class_pred,
+                'n_pred': n_pred,
+                'mu_a_pred': mu_a_pred,
+                'mu_s_pred': mu_s_pred,
+                'g_pred': g_pred,
+                'mu_s_prime_pred': mu_s_prime_pred
+            }
 
 

@@ -67,18 +67,20 @@ def predict_material(model, images, device):
     """재료 분류 및 물리 계수 예측"""
     with torch.no_grad():
         images = images.to(device)
-        class_logits, class_pred, physical_coeffs = model.predict_material(images)
+        results = model.predict_material(images)
     
     # Softmax for probabilities
     import torch.nn.functional as F
-    class_probs = F.softmax(class_logits, dim=1)
+    class_probs = F.softmax(results['class_logits'], dim=1)
     
     return {
-        'class_pred': class_pred.cpu().numpy(),
+        'class_pred': results['class_pred'].cpu().numpy(),
         'class_probs': class_probs.cpu().numpy(),
-        'n': physical_coeffs[:, 0].cpu().numpy(),
-        'mu_a': physical_coeffs[:, 1].cpu().numpy(),
-        'mu_s_prime': physical_coeffs[:, 2].cpu().numpy()
+        'n': results['n_pred'].cpu().numpy(),
+        'mu_a': results['mu_a_pred'].cpu().numpy(),
+        'mu_s': results['mu_s_pred'].cpu().numpy(),
+        'g': results['g_pred'].cpu().numpy(),
+        'mu_s_prime': results['mu_s_prime_pred'].cpu().numpy()
     }
 
 
@@ -103,6 +105,9 @@ def inference_on_dataset(model, dataset, device, save_dir):
         pred_tissue_idx = int(preds['class_pred'][0])
         pred_tissue_name = OpticalScatteringDataset.IDX_TO_TISSUE.get(pred_tissue_idx, 'unknown')
         
+        # mu_s_prime 계산 (μₛ' = μₛ × (1-g))
+        mu_s_prime_true = mu_s_true.numpy() * (1 - g_true.numpy())
+        
         result = {
             'idx': idx,
             'tissue_true': tissue_name,
@@ -110,18 +115,30 @@ def inference_on_dataset(model, dataset, device, save_dir):
             'class_probs': preds['class_probs'][0].tolist(),
             'n_true': float(n_true.numpy()),
             'n_pred': float(preds['n'][0]),
+            'mu_a_true': float(mu_a_true.numpy()),
             'mu_a_pred': float(preds['mu_a'][0]),
+            'mu_s_true': float(mu_s_true.numpy()),
+            'mu_s_pred': float(preds['mu_s'][0]),
+            'g_true': float(g_true.numpy()),
+            'g_pred': float(preds['g'][0]),
+            'mu_s_prime_true': float(mu_s_prime_true),
             'mu_s_prime_pred': float(preds['mu_s_prime'][0]),
             'feature_shape': list(features.shape)
         }
         results.append(result)
     
-    # 통계 계산
-    n_true_list = [r['n_true'] for r in results]
-    n_pred_list = [r['n_pred'] for r in results]
+    # 통계 계산 - 모든 계수
+    coeffs = ['n', 'mu_a', 'mu_s', 'g', 'mu_s_prime']
+    coeff_stats = {}
     
-    mse = np.mean([(t - p)**2 for t, p in zip(n_true_list, n_pred_list)])
-    mae = np.mean([abs(t - p) for t, p in zip(n_true_list, n_pred_list)])
+    for coeff in coeffs:
+        true_list = [r[f'{coeff}_true'] for r in results]
+        pred_list = [r[f'{coeff}_pred'] for r in results]
+        
+        mse = np.mean([(t - p)**2 for t, p in zip(true_list, pred_list)])
+        mae = np.mean([abs(t - p) for t, p in zip(true_list, pred_list)])
+        
+        coeff_stats[coeff] = {'mse': mse, 'mae': mae}
     
     # Classification accuracy
     correct = sum(1 for r in results if r['tissue_true'] == r['tissue_pred'])
@@ -131,31 +148,51 @@ def inference_on_dataset(model, dataset, device, save_dir):
     print(f"Total samples: {len(results)}")
     print(f"\n📊 Classification:")
     print(f"  Accuracy: {accuracy:.2f}% ({correct}/{len(results)})")
-    print(f"\n📐 Regression (Refractive Index):")
-    print(f"  MSE: {mse:.6f}")
-    print(f"  MAE: {mae:.6f}")
+    print(f"\n📐 Regression (All Coefficients):")
+    print(f"  n (Refractive Index):")
+    print(f"    MSE: {coeff_stats['n']['mse']:.6f}, MAE: {coeff_stats['n']['mae']:.6f}")
+    print(f"  mu_a (Absorption):")
+    print(f"    MSE: {coeff_stats['mu_a']['mse']:.6f}, MAE: {coeff_stats['mu_a']['mae']:.6f}")
+    print(f"  mu_s (Scattering):")
+    print(f"    MSE: {coeff_stats['mu_s']['mse']:.6f}, MAE: {coeff_stats['mu_s']['mae']:.6f}")
+    print(f"  g (Anisotropy):")
+    print(f"    MSE: {coeff_stats['g']['mse']:.6f}, MAE: {coeff_stats['g']['mae']:.6f}")
+    print(f"  mu_s_prime (Reduced Scattering):")
+    print(f"    MSE: {coeff_stats['mu_s_prime']['mse']:.6f}, MAE: {coeff_stats['mu_s_prime']['mae']:.6f}")
     
     # 클래스별 통계
-    print(f"\n=== Tissue-wise Results ===")
+    print(f"\n=== Tissue-wise Results (Detailed) ===")
     tissues = sorted(set([r['tissue_true'] for r in results]))
-    
-    # Header
-    print(f"{'Tissue':<20} {'Count':<7} {'Accuracy':<10} {'n_true':<8} {'n_pred':<15} {'MSE':<10} {'MAE':<10}")
-    print("-" * 100)
     
     for tissue in tissues:
         tissue_results = [r for r in results if r['tissue_true'] == tissue]
         tissue_correct = sum(1 for r in tissue_results if r['tissue_true'] == r['tissue_pred'])
         tissue_accuracy = 100.0 * tissue_correct / len(tissue_results)
         
-        tissue_n_true = [r['n_true'] for r in tissue_results]
-        tissue_n_pred = [r['n_pred'] for r in tissue_results]
-        tissue_mse = np.mean([(t - p)**2 for t, p in zip(tissue_n_true, tissue_n_pred)])
-        tissue_mae = np.mean([abs(t - p) for t, p in zip(tissue_n_true, tissue_n_pred)])
+        print(f"\n{tissue} (n={len(tissue_results)}, Accuracy={tissue_accuracy:.1f}%)")
+        print("-" * 100)
         
-        print(f"{tissue:<20} {len(tissue_results):<7} {tissue_accuracy:>6.1f}%    "
-              f"{tissue_n_true[0]:.2f}     {np.mean(tissue_n_pred):.4f}±{np.std(tissue_n_pred):.4f}  "
-              f"{tissue_mse:.6f}  {tissue_mae:.6f}")
+        # 각 계수별 통계 (5개)
+        coeffs_to_show = [
+            ('n', 'n'),
+            ('mu_a', 'mu_a'),
+            ('mu_s', 'mu_s'),
+            ('g', 'g'),
+            ('mu_s_prime', "mu_s_prime")
+        ]
+        
+        for coeff, name in coeffs_to_show:
+            true_vals = [r[f'{coeff}_true'] for r in tissue_results]
+            pred_vals = [r[f'{coeff}_pred'] for r in tissue_results]
+            
+            mse = np.mean([(t - p)**2 for t, p in zip(true_vals, pred_vals)])
+            mae = np.mean([abs(t - p) for t, p in zip(true_vals, pred_vals)])
+            mean_true = np.mean(true_vals)
+            mean_pred = np.mean(pred_vals)
+            std_pred = np.std(pred_vals)
+            
+            # ± 양옆에 띄어쓰기 추가
+            print(f"  {name:<10s}: True={mean_true:>10.6f}, Pred={mean_pred:>10.6f} +- {std_pred:<10.6f}, MSE={mse:>12.6e}, MAE={mae:>12.6e}")
     
     # Confusion Matrix
     print(f"\n=== Confusion Matrix ===")
