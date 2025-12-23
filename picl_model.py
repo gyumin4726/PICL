@@ -417,13 +417,28 @@ class PICLModel(nn.Module):
             channel_first=True
         )
         
+        # Spatial size after adaptive pooling (will be set dynamically)
+        self.spatial_size = 7  # Default target size
+        
+        # Spatial projection: flatten 7x7 spatial -> 1024 features
+        # Input: C * H * W = 1024 * 7 * 7 = 50176
+        # Output: 1024 (temporal_config['input_dim'])
+        spatial_input_dim = temporal_config['input_dim'] * self.spatial_size * self.spatial_size
+        self.spatial_proj = nn.Sequential(
+            nn.Linear(spatial_input_dim, 2048),
+            nn.LayerNorm(2048),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(2048, temporal_config['input_dim'])
+        )
+        
         # 2. 1D Mamba + SequenceToValue (Temporal Sequence Modeler)
         self.temporal = SequenceToValue(
             input_dim=temporal_config['input_dim'],
             device=temporal_config['device']
         )
         
-        # Temporal feature dimension: average pooling으로 1024 차원 유지
+        # Temporal feature dimension: 1024
         temporal_feature_dim = temporal_config['input_dim']  # 1024
         
         # 3. MLP Regressor (Physical Coefficients Predictor)
@@ -482,7 +497,7 @@ class PICLModel(nn.Module):
         # PATH 1: Neural Network Prediction
         # ========================================
         
-        # 1. 2D VMamba: Extract spatial features
+        # 1. 2D VMamba: Extract spatial features (공간 처리 완료!)
         x_flat = images.view(B * T, C, H, W)  # (B*T, C, H, W)
         features = self.backbone(x_flat)  # Returns tuple or list
         
@@ -492,37 +507,34 @@ class PICLModel(nn.Module):
         if isinstance(features, (tuple, list)):
             features = features[0]  # Sometimes nested, get again
         
-        # Preserve spatial structure: Use adaptive pooling to reduce but not eliminate spatial info
-        # Instead of (1,1), use (7,7) to keep some spatial structure
-        # This allows us to model temporal relationships per spatial location
+        # Adaptive pooling to fixed spatial size
         _, C_feat, H_feat, W_feat = features.shape
-        
-        # Adaptive pooling to reduce spatial size but preserve structure
-        # (B*T, 1024, H', W') -> (B*T, 1024, 7, 7) for manageable size
-        target_size = min(7, H_feat, W_feat)  # Use smaller of 7 or actual size
+        target_size = self.spatial_size  # Fixed 7x7
         features = F.adaptive_avg_pool2d(features, (target_size, target_size))  # (B*T, 1024, 7, 7)
         
-        # Reshape to (B, T, C, H, W) for temporal processing per spatial location
+        # Reshape to (B, T, C, H, W)
         features = features.view(B, T, C_feat, target_size, target_size)  # (B, T, 1024, 7, 7)
         
-        # Process temporal sequence for each spatial location
-        # Reshape: (B, T, C, H, W) -> (B*H*W, T, C) to process each spatial location independently
+        # ========================================
+        # 2. Spatial Flatten + Projection
+        # ========================================
+        # 각 타임스텝의 7x7 공간을 하나의 feature vector로
+        # (B, T, C, H, W) -> (B, T, C*H*W)
         B, T, C, H_sp, W_sp = features.shape
-        features_reshaped = features.permute(0, 3, 4, 1, 2).contiguous()  # (B, H_sp, W_sp, T, C)
-        features_reshaped = features_reshaped.view(B * H_sp * W_sp, T, C)  # (B*H_sp*W_sp, T, C)
+        features_flat = features.view(B, T, C * H_sp * W_sp)  # (B, 5, 50176)
         
-        # 2. 1D Mamba: Process temporal sequence for each spatial location
-        temporal_features_all = self.temporal(features_reshaped)  # (B*H_sp*W_sp, 5, 1024)
+        # Learnable projection: 50176 -> 1024
+        # 공간 정보를 보존하면서 차원 축소
+        features_projected = self.spatial_proj(features_flat)  # (B, 5, 1024)
         
-        # Average pooling over time steps: (B*H_sp*W_sp, 5, 1024) → (B*H_sp*W_sp, 1024)
-        temporal_features = temporal_features_all.mean(dim=1)  # (B*H_sp*W_sp, 1024)
+        # ========================================
+        # 3. 1D Mamba: Temporal Sequence Modeling
+        # ========================================
+        # 이제 깔끔한 시계열: 각 샘플마다 5개 타임스텝
+        temporal_features_all = self.temporal(features_projected)  # (B, 5, 1024)
         
-        # Reshape back and aggregate spatial information
-        temporal_features = temporal_features.view(B, H_sp, W_sp, -1)  # (B, H_sp, W_sp, 1024)
-        # Aggregate spatial information: average pooling
-        temporal_features = temporal_features.permute(0, 3, 1, 2)  # (B, 1024, H_sp, W_sp)
-        temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))  # (B, 1024, 1, 1)
-        temporal_features = temporal_features.flatten(1)  # (B, 1024)
+        # 마지막 타임스텝: 모든 시간 정보 누적 (Mamba의 설계 의도)
+        temporal_features = temporal_features_all[:, -1, :]  # (B, 1024)
         
         # 3. 병렬 경로: 물리계수 예측 + ETF 분류
         # 경로 1: MLP Regressor → 4개 계수 예측
@@ -671,34 +683,22 @@ class PICLModel(nn.Module):
             if isinstance(features, (tuple, list)):
                 features = features[0]
             
-            # Preserve spatial structure: Use adaptive pooling to reduce but not eliminate spatial info
+            # Adaptive pooling
             _, C_feat, H_feat, W_feat = features.shape
+            target_size = self.spatial_size
+            features = F.adaptive_avg_pool2d(features, (target_size, target_size))
+            features = features.view(B, T, C_feat, target_size, target_size)
             
-            # Adaptive pooling to reduce spatial size but preserve structure
-            target_size = min(7, H_feat, W_feat)  # Use smaller of 7 or actual size
-            features = F.adaptive_avg_pool2d(features, (target_size, target_size))  # (B*T, 1024, 7, 7)
-            
-            # Reshape to (B, T, C, H, W) for temporal processing per spatial location
-            features = features.view(B, T, C_feat, target_size, target_size)  # (B, T, 1024, 7, 7)
-            
-            # Process temporal sequence for each spatial location
+            # 2. Spatial Flatten + Projection
             B, T, C, H_sp, W_sp = features.shape
-            features_reshaped = features.permute(0, 3, 4, 1, 2).contiguous()  # (B, H_sp, W_sp, T, C)
-            features_reshaped = features_reshaped.view(B * H_sp * W_sp, T, C)  # (B*H_sp*W_sp, T, C)
+            features_flat = features.view(B, T, C * H_sp * W_sp)
+            features_projected = self.spatial_proj(features_flat)
             
-            # 2. 1D Mamba: Process temporal sequence for each spatial location
-            temporal_features_all = self.temporal(features_reshaped)  # (B*H_sp*W_sp, 5, 1024)
+            # 3. 1D Mamba
+            temporal_features_all = self.temporal(features_projected)
+            temporal_features = temporal_features_all[:, -1, :]
             
-            # Average pooling over time steps: (B*H_sp*W_sp, 5, 1024) → (B*H_sp*W_sp, 1024)
-            temporal_features = temporal_features_all.mean(dim=1)  # (B*H_sp*W_sp, 1024)
-            
-            # Reshape back and aggregate spatial information
-            temporal_features = temporal_features.view(B, H_sp, W_sp, -1)  # (B, H_sp, W_sp, 1024)
-            temporal_features = temporal_features.permute(0, 3, 1, 2)  # (B, 1024, H_sp, W_sp)
-            temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))  # (B, 1024, 1, 1)
-            temporal_features = temporal_features.flatten(1)  # (B, 1024)
-            
-            # 3. MLP Regressor
+            # 4. MLP Regressor
             n_pred, mu_a_pred, mu_s_pred, g_pred = self.regressor(temporal_features)
             mu_s_prime_pred = mu_s_pred * (1 - g_pred)  # mu_s' = mu_s * (1 - g)
             
@@ -728,37 +728,28 @@ class PICLModel(nn.Module):
             if isinstance(features, (tuple, list)):
                 features = features[0]
             
-            # Preserve spatial structure
+            # Adaptive pooling
             _, C_feat, H_feat, W_feat = features.shape
-            target_size = min(7, H_feat, W_feat)
+            target_size = self.spatial_size
             features = F.adaptive_avg_pool2d(features, (target_size, target_size))
-            
-            # Reshape for temporal processing
             features = features.view(B, T, C_feat, target_size, target_size)
+            
+            # 2. Spatial Flatten + Projection
             B, T, C, H_sp, W_sp = features.shape
-            features_reshaped = features.permute(0, 3, 4, 1, 2).contiguous()
-            features_reshaped = features_reshaped.view(B * H_sp * W_sp, T, C)
+            features_flat = features.view(B, T, C * H_sp * W_sp)
+            features_projected = self.spatial_proj(features_flat)
             
-            # 2. 1D Mamba: Process temporal sequence for each spatial location
-            temporal_features_all = self.temporal(features_reshaped)  # (B*H_sp*W_sp, 5, 1024)
+            # 3. 1D Mamba
+            temporal_features_all = self.temporal(features_projected)
+            temporal_features = temporal_features_all[:, -1, :]
             
-            # Average pooling over time steps: (B*H_sp*W_sp, 5, 1024) → (B*H_sp*W_sp, 1024)
-            temporal_features = temporal_features_all.mean(dim=1)  # (B*H_sp*W_sp, 1024)
-            
-            # Reshape back and aggregate spatial information
-            temporal_features = temporal_features.view(B, H_sp, W_sp, -1)  # (B, H_sp, W_sp, 1024)
-            # Aggregate spatial information: average pooling
-            temporal_features = temporal_features.permute(0, 3, 1, 2)  # (B, 1024, H_sp, W_sp)
-            temporal_features = F.adaptive_avg_pool2d(temporal_features, (1, 1))  # (B, 1024, 1, 1)
-            temporal_features = temporal_features.flatten(1)  # (B, 1024)
-            
-            # 3. Get physical coefficients
+            # 4. Get physical coefficients
             n_pred, mu_a_pred, mu_s_pred, g_pred = self.regressor(temporal_features)
             mu_s_prime_pred = mu_s_pred * (1 - g_pred)  # mu_s' = mu_s * (1 - g)
             physical_coeffs = torch.stack([n_pred, mu_a_pred, mu_s_prime_pred], dim=1)  # (B, 3)
             
-            # 4. ETF Classifier로 분류
-            class_logits, class_pred = self.etf_classifier(temporal_features)  # (B, num_classes), (B,)
+            # 5. ETF Classifier
+            class_logits, class_pred = self.etf_classifier(temporal_features)
             
             return class_logits, class_pred, physical_coeffs
 
