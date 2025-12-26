@@ -6,16 +6,23 @@
 
 ### 핵심 목표
 - **입력**: 5장의 시간 게이트 광학 산란 이미지 시퀀스
-- **출력**: 3가지 물리계수 예측
+- **출력**: 4가지 물리계수 예측
   1. 굴절률 (n)
   2. 흡수 계수 (μa)
-  3. 등방 환산 산란 계수 (μs')
+  3. 산란 계수 (μs)
+  4. 비등방성 인자 (g)
+  - 유도 계수: μs' = μs × (1 - g) (등방 환산 산란 계수)
 - **방법**: 물리 정보 기반 신경망 (PINN) - 데이터 손실 + 물리 손실
 
 ### 주요 혁신
 1. **이중 경로 아키텍처**: 신경망 예측 경로와 물리량 계산 경로의 병렬 처리
 2. **시간 의존 확산 방정식 통합**: 예측된 물리계수가 물리 법칙을 만족하는지 자동 검증
 3. **효율적인 시퀀스 모델링**: 1D Mamba를 사용한 시간적 의존성 처리
+   - Spatial Projection으로 공간 정보 통합 후 시간 모델링
+   - 마지막 타임스텝 활용으로 시간 동역학 보존
+4. **FT-Transformer 기반 회귀**: Feature Tokenizer + Transformer로 물리 계수 간 상관관계 학습
+   - Single head로 4개 계수 동시 예측
+   - Self-attention으로 복잡한 비선형 관계 모델링
 
 ## 🏗️ 아키텍처 개요
 
@@ -29,17 +36,18 @@ PICL 모델은 **동시에 실행되는 두 개의 독립적인 경로**로 구�
 ├─ PATH 1: 신경망 예측 경로 ────────────────────┐
 │   │                                              │
 │   ├─ 2D VMamba (공간 특징 추출)                 │
-│   │   (B, 5, 3, 224, 224) → (B*5, 1024, H', W')│
+│   │   (B, 5, 3, 224, 224) → (B*5, 1024, 7, 7) │
 │   │                                              │
-│   ├─ Global Average Pooling (공간 차원 제거)    │
-│   │   (B*5, 1024, H', W') → (B*5, 1024)        │
+│   ├─ Spatial Flatten + Projection (공간 통합)  │
+│   │   (B, 5, 1024, 7, 7) → (B, 5, 1024)        │
 │   │                                              │
-│   ├─ 1D Mamba + SequenceToValue (시간 처리)     │
-│   │   (B, 5, 1024) → (B, 512)                   │
+│   ├─ 1D Mamba (시간 시퀀스 모델링)              │
+│   │   (B, 5, 1024) → (B, 5, 1024)              │
+│   │   마지막 타임스텝 선택 → (B, 1024)          │
 │   │                                              │
-│   └─ MLP Regressor (물리계수 예측)              │
-│       (B, 512) → (B, 3)                          │
-│       출력: n_pred, μa_pred, μs'_pred           │
+│   └─ FT-Transformer (물리계수 예측)             │
+│       (B, 1024) → (B, 4)                         │
+│       출력: n_pred, μa_pred, μs_pred, g_pred   │
 │                                                 │
 └─ PATH 2: 물리량 계산 경로 ────────────────────┤
     │                                              │
@@ -74,30 +82,44 @@ PICL 모델은 **동시에 실행되는 두 개의 독립적인 경로**로 구�
   - **공간 차원 보존**: `(B*5, 1024, H', W')` 형태로 출력
 - **구현**: `vmamba_backbone.py`의 `VMambaBackbone` 클래스
 
-#### 2. **Global Average Pooling** (공간 차원 제거)
-- **입력**: `(B*5, 1024, H', W')` - 공간 차원이 있는 특징맵
-- **처리**: 각 특징맵을 `(1, 1)`로 풀링하여 공간 정보를 평균으로 집약
-- **출력**: `(B*5, 1024)` - 각 이미지마다 하나의 벡터
-- **이유**: 1D Mamba는 시퀀스 형태 `(B, T, D)` 입력이 필요하므로 공간 차원 제거 필요
+#### 2. **Spatial Flatten + Projection** (공간 정보 통합)
+- **입력**: `(B, 5, 1024, 7, 7)` - 시간별로 재구성된 공간 특징맵
+- **처리**: 
+  - 각 타임스텝의 7×7 공간을 하나의 벡터로 평탄화 → `(B, 5, 50176)`
+  - 학습 가능한 projection 네트워크로 차원 축소 → `(B, 5, 1024)`
+  - 공간 정보를 보존하면서 효율적인 표현 학습
+- **출력**: `(B, 5, 1024)` - 공간 정보가 통합된 시계열 특징
+- **장점**: 공간 상관관계를 유지하면서 1D Mamba에 적합한 형태로 변환
 
-#### 3. **1D Mamba + SequenceToValue** (시간 시퀀스 모델러)
-- **입력**: `(B, 5, 1024)` - 5개 시간 스텝의 특징 벡터 시퀀스
+#### 3. **1D Mamba** (시간 시퀀스 모델러)
+- **입력**: `(B, 5, 1024)` - 5개 타임스텝의 특징 벡터 시퀀스
 - **처리**:
   - 1D Mamba가 시퀀스를 처리하여 시간적 의존성 모델링
-  - SequenceToValue가 마지막 시간 스텝(`h_5`) 선택
-  - `h_5`는 모든 이전 시간 정보를 포함한 누적 특징
-- **출력**: `(B, 512)` - 최종 시간적 특징 벡터
+  - 각 타임스텝이 이전 타임스텝의 정보를 누적적으로 포함
+  - 출력: `(B, 5, 1024)` - 모든 타임스텝의 hidden states
+  - **마지막 타임스텝 선택**: `h_5 = output[:, -1, :]`
+  - `h_5`는 전체 시간 진화 정보를 누적한 최종 state
+- **출력**: `(B, 1024)` - 시간 정보가 누적된 최종 특징 벡터
 - **구현**: `mamba_1d_temporal.py`의 `SequenceToValue` 클래스
+- **설계 의도**: 평균 풀링 대신 마지막 state 사용으로 시간 동역학 보존
 
 #### 4. **병렬 헤드** (물리계수 예측 + 재료 분류)
 - **입력**: `(B, 1024)` - 시간적 특징 벡터
-- **MLP Regressor** (물리계수 예측):
-  - 처리: 3개의 완전연결층을 통과하여 물리계수 예측
-  - 출력: `(B, 3)` - 3개의 물리계수
+- **FT-Transformer Regressor** (물리계수 예측):
+  - 아키텍처:
+    1. Feature Tokenization: 1024 → 16 tokens × 64 dim
+    2. Token Embedding: 64 → 192 dim
+    3. [CLS] Token 추가 (정보 집약용)
+    4. Transformer Encoder (3 layers, 8 heads)
+    5. Single Output Head: [CLS] → 4개 계수 동시 예측
+  - 출력: `(B, 4)` - 4개의 물리계수
     - `n_pred`: 굴절률 (Refractive Index)
     - `mu_a_pred`: 흡수 계수 (Absorption Coefficient)
-    - `mu_s_prime_pred`: 등방 환산 산란 계수 (Reduced Scattering Coefficient)
-  - 구현: `picl_model.py`의 `MLPRegressor` 클래스
+    - `mu_s_pred`: 산란 계수 (Scattering Coefficient)
+    - `g_pred`: 비등방성 인자 (Anisotropy Factor)
+    - 유도: `mu_s_prime = mu_s × (1 - g)` (등방 환산 산란 계수)
+  - 구현: `picl_model.py`의 `FTTransformerRegressor` 클래스
+  - **핵심**: Single head로 4개 계수를 동시 예측하여 물리 계수 간 상관관계 학습
 - **ETF Classifier** (재료 분류):
   - 처리: Equiangular Tight Frame 기반 분류기
   - 출력: `(B, 5)` - 5개 재료에 대한 로짓
@@ -180,10 +202,15 @@ PICL 모델은 **동시에 실행되는 두 개의 독립적인 경로**로 구�
 #### 3. **데이터 손실** (Data Loss)
 - **계산**:
   ```python
-  data_loss = HuberLoss(n_pred, n_true, delta=0.1)
+  data_loss_n = HuberLoss(n_pred, n_true, delta=0.1)
+  data_loss_mu_a = HuberLoss(mu_a_pred, mu_a_true, delta=0.1)
+  data_loss_mu_s = HuberLoss(mu_s_pred, mu_s_true, delta=0.1)
+  data_loss_g = HuberLoss(g_pred, g_true, delta=0.1)
+  data_loss = (data_loss_n + data_loss_mu_a + data_loss_mu_s + data_loss_g) / 4
   ```
-- **의미**: 예측된 굴절률과 실제 굴절률 간의 차이
+- **의미**: 예측된 4개 물리계수와 실제 값 간의 차이
 - **Huber Loss 사용**: 초기 큰 오차에 대해 더 안정적인 학습
+- **평균**: 4개 계수의 균형잡힌 학습을 위해 평균 사용
 
 #### 4. **분류 손실** (Classification Loss)
 - **계산**:
@@ -269,14 +296,15 @@ features = backbone(images)  # (B, 5, 1024)
 from mamba_1d_temporal import Mamba1D, SequenceToValue
 
 # 1D Mamba (공식 구현)
-mamba1d = Mamba1D(d_model=512, layer_idx=0, device='cuda')
-sequence = torch.randn(2, 5, 512)  # (B, T, D)
-processed = mamba1d(sequence)  # (B, 5, 512)
+mamba1d = Mamba1D(d_model=1024, layer_idx=0, device='cuda')
+sequence = torch.randn(2, 5, 1024)  # (B, T, D)
+processed = mamba1d(sequence)  # (B, 5, 1024) - 모든 타임스텝 출력
 
 # 시퀀스-투-밸류 변환
-seq2val = SequenceToValue(input_dim=1024, d_model=512, device='cuda')
-features = torch.randn(2, 5, 1024)  # 2D VMamba에서
-final_features = seq2val(features)  # (B, 512) - 모든 시간 정보를 포함한 h_5
+seq2val = SequenceToValue(input_dim=1024, device='cuda')
+features = torch.randn(2, 5, 1024)  # 2D VMamba + Spatial Projection에서
+temporal_features_all = seq2val(features)  # (B, 5, 1024)
+temporal_features = temporal_features_all[:, -1, :]  # (B, 1024) - 마지막 타임스텝
 ```
 
 #### 완전한 PICL 파이프라인 (물리계수 예측 + PINN 손실)
@@ -290,7 +318,6 @@ model = PICLModel(
     pretrained_path='./vssm_base_0229_ckpt_epoch_237.pth',
     temporal_config={
         'input_dim': 1024,
-        'd_model': 512,
         'device': 'cuda'
     },
     physics_config={
@@ -310,13 +337,17 @@ results = model(images, n_true)
 # 결과 확인
 print(f"예측된 굴절률: {results['n_pred']}")
 print(f"예측된 흡수 계수: {results['mu_a_pred']}")
-print(f"예측된 산란 계수: {results['mu_s_prime_pred']}")
+print(f"예측된 산란 계수: {results['mu_s_pred']}")
+print(f"예측된 비등방성 인자: {results['g_pred']}")
+print(f"유도된 등방 환산 산란 계수: {results['mu_s_prime_pred']}")
 print(f"총 손실: {results['total_loss']}")
 print(f"데이터 손실: {results['data_loss']}")
 print(f"물리 손실: {results['physics_loss']}")
 
 # 예측만 (추론용 - 손실 계산 없음)
 n_pred, mu_a_pred, mu_s_prime_pred = model.predict_coefficients(images)
+# 또는 재료 분류 + 물리계수 예측
+results = model.predict_material(images)  # 4개 계수 + 분류 결과
 ```
 
 ### 3. 훈련 및 추론
@@ -401,13 +432,17 @@ n/c * ∂Φ/∂t + μa*Φ - ∇·(D∇Φ) = S(r,t) ≈ 0
 #### 각 물리계수의 역할
 - **n (굴절률)**: 빛의 속도를 조절 (`c/n` = 매질 내 빛의 속도)
 - **μa (흡수 계수)**: 빛이 얼마나 흡수되는지 결정
-- **μs' (등방 환산 산란 계수)**: 빛이 얼마나 산란되는지 결정
+- **μs (산란 계수)**: 빛이 얼마나 산란되는지 결정 (총 산란)
+- **g (비등방성 인자)**: 산란의 방향성 (0: 등방성, 1: 전방 산란)
+- **μs' (등방 환산 산란 계수)**: μs × (1 - g)로 계산 (유효 산란)
 - **D (확산 계수)**: D = 1/(3*(μa + μs'))로 계산
 
 #### PINN에서의 활용
-- 예측된 물리계수 (`n_pred`, `μa_pred`, `μs'_pred`)를 방정식에 대입
+- 예측된 물리계수 (`n_pred`, `μa_pred`, `μs_pred`, `g_pred`)로부터 `μs'_pred = μs_pred × (1 - g_pred)` 계산
+- 예측된 계수를 방정식에 대입
 - 원본 이미지에서 계산된 물리량 (`Φ`, `∂Φ/∂t`, `∇²Φ`)을 방정식에 대입
 - 잔차(residual)를 계산하여 물리 법칙 만족 여부 검증
+- 4개 기본 계수를 예측하여 물리적 관계 (μs' = μs(1-g)) 명시적으로 모델링
 
 ## 📁 저장소 구조
 
@@ -431,7 +466,7 @@ PICL/
 │   └── 물리량 계산 함수들 (시간 미분, 공간 미분 등)
 ├── picl_model.py                   # 완전한 PICL 통합 모델
 │   └── PICLModel: PATH 1 + PATH 2 통합 클래스
-│   └── MLPRegressor: 물리계수 예측 헤드
+│   └── FTTransformerRegressor: 물리계수 예측 헤드 (Transformer 기반)
 │   └── ETFClassifier: 재료 분류 헤드
 │   └── 전체 파이프라인 자동 실행
 ├── train_picl.py                   # 훈련 스크립트
@@ -457,7 +492,7 @@ PICL/
 ## 🧪 주요 특징
 
 ### 1. **이중 경로 아키텍처 (Dual-Path Architecture)**
-- **PATH 1 (신경망)**: 2D VMamba → 1D Mamba → MLP → 물리계수 예측
+- **PATH 1 (신경망)**: 2D VMamba → Spatial Projection → 1D Mamba (마지막 timestep) → FT-Transformer → 4개 물리계수 예측
 - **PATH 2 (물리)**: 원본 이미지 → 물리량 계산 → PDE 검증
 - **동시 실행**: 두 경로가 병렬로 실행되어 효율성 극대화
 
@@ -499,11 +534,14 @@ PICL/
 - **출력**: 물리계수 예측
   - 굴절률 (n): 1.0 ~ 1.77
   - 흡수 계수 (μa): 0.01 ~ 0.1 mm⁻¹
-  - 등방 환산 산란 계수 (μs'): 0.5 ~ 2.0 mm⁻¹
-- **아키텍처**: VMamba + 1D Mamba + MLP Regressor + ETF Classifier + PINN 손실
+  - 산란 계수 (μs): 0.5 ~ 50.0 mm⁻¹
+  - 비등방성 인자 (g): 0.89 ~ 0.95
+  - 등방 환산 산란 계수 (μs'): μs × (1 - g)로 계산
+- **아키텍처**: VMamba + Spatial Projection + 1D Mamba (마지막 timestep) + FT-Transformer + ETF Classifier + PINN 손실
 - **손실 함수**: 
   - Classification Loss (CrossEntropy) - 가중치: 10.0
   - Data Loss (Huber Loss, delta=0.1) - 가중치: 1.0
+    - 4개 계수 (n, μa, μs, g) 각각에 대해 계산 후 평균
   - Physics Loss (Huber Loss, delta=0.1) - 가중치: 0.01
 - **물리 단위**: 
   - 공간: `dx=dy=1e-3 m` (1.0 mm)
@@ -527,7 +565,7 @@ PICL/
   - ✅ 동시 실행 및 자동 손실 계산
 
 #### 기능
-- ✅ 3가지 물리계수 예측 (n, μa, μs')
+- ✅ 4가지 물리계수 예측 (n, μa, μs, g) + μs' 유도
 - ✅ 재료 분류 (ETF Classifier)
 - ✅ 원본 이미지에서 물리량 계산
 - ✅ PDE 방정식 검증
@@ -535,6 +573,8 @@ PICL/
 - ✅ Huber Loss 적용 (데이터 및 물리 손실)
 - ✅ 물리 단위 통합 (dx, dy, dt)
 - ✅ 모든 시간 스텝에서 공간 미분 계산
+- ✅ Spatial Projection으로 공간-시간 처리 개선
+- ✅ FT-Transformer로 물리 계수 간 상관관계 학습
 
 #### 훈련 및 추론 도구
 - ✅ **train_picl.py**: 완전한 훈련 스크립트
